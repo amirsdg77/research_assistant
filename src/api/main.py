@@ -1,9 +1,7 @@
 """FastAPI app entrypoint.
 
-Step 2 ships only the health check so `docker compose up` succeeds end-to-end.
-Step 3 wires structlog into startup and binds a per-request request_id so
-every log line emitted while handling a request carries it.
-Real routes get added in step 13.
+Configures structured logging on startup and binds a per-request request_id
+in middleware so every log line emitted while handling a request carries it.
 """
 from __future__ import annotations
 
