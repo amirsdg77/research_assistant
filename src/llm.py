@@ -68,6 +68,8 @@ _MODEL_BY_PURPOSE: dict[LLMPurpose, str] = {
 
 # JSONB columns truncate prompt/response payloads over this size. Avoids
 # blowing up the DB on a runaway tool output without losing the LLM result.
+# Not a deployer-tunable: the cap is tied to the truncation marker shape
+# below; bump both together if you ever need more headroom.
 _MAX_JSONB_BYTES = 50 * 1024
 
 
@@ -314,6 +316,9 @@ async def _log_llm_call_safely(
 # --- Embeddings ----------------------------------------------------------
 
 
+# OpenAI's embeddings endpoint accepts up to 2048 inputs per request, but
+# we cap at 100 to keep individual calls quick and predictable for logging
+# and retry purposes. Not deployer-tunable.
 _EMBEDDING_BATCH = 100
 
 

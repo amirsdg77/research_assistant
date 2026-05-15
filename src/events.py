@@ -78,6 +78,10 @@ class AgentEvent:
 # --- Bus -----------------------------------------------------------------
 
 
+# Per-subscriber queue capacity. Sized for a typical session emitting
+# ~30-100 events; high enough that a normally-paced SSE client never
+# evicts. If a queue fills, publish() drops the oldest. Not deployer-tunable
+# — change here if event volume per session grows materially.
 _QUEUE_MAXSIZE = 256
 
 
