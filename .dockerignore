@@ -1,0 +1,16 @@
+# Scoped to project root only — does NOT recurse into src/ so prompt .md files are preserved.
+/.env
+/.env.local
+/.git
+/.gitignore
+/.venv
+/venv
+/__pycache__
+/.pytest_cache
+/.mypy_cache
+/.ruff_cache
+/dist
+/build
+/*.egg-info
+/README.md
+/node_modules

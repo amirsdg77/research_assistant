@@ -1,0 +1,61 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chroma:
+    image: chromadb/chroma:0.5.20
+    volumes:
+      - chroma_data:/chroma/chroma
+    # Container listens on 8000 internally; exposed to host on 8001 to avoid
+    # collision with the app service. Inside the compose network the app
+    # talks to chroma on :8000 (see CHROMA_PORT in .env.example).
+    ports:
+      - "8001:8000"
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v2/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network these override anything in .env so
+      # devs can keep `localhost` values in .env for local (non-docker) runs.
+      POSTGRES_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  chroma_data:
