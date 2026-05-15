@@ -20,6 +20,7 @@ from src.logging_setup import (
     configure_logging,
     get_logger,
 )
+from src.prompts import ALL_PROMPTS
 
 
 log = get_logger(__name__)
@@ -29,6 +30,10 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     configure_logging()
     log.info("app.startup", version=app.version)
+    # Importing src.prompts already validated all prompts exist (it loads them
+    # at import time). Log their sizes so we can spot accidental empties.
+    for name, body in ALL_PROMPTS.items():
+        log.info("prompt.loaded", name=name, bytes=len(body))
     yield
     log.info("app.shutdown")
 
