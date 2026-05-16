@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Research Agent</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <!-- Markdown renderer for the final report. Loaded from CDN to keep the
+       build pipeline at zero. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">research-agent</div>
+    <div class="session-badge" id="session-badge" hidden></div>
+  </header>
+
+  <section class="composer">
+    <div class="composer-inner">
+      <textarea
+        id="goal-input"
+        rows="3"
+        placeholder="What do you want to investigate? e.g. 'Survey the trade-offs of long-context attention in modern LLMs.'"
+      ></textarea>
+      <div class="composer-side">
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple
+                 accept=".pdf,.docx,.txt,.md" hidden />
+          <button class="dz-button" id="dz-button" type="button">
+            attach files
+          </button>
+          <div class="dz-hint">PDF, DOCX, TXT, MD &middot; max 10 MB each</div>
+          <div class="file-chips" id="file-chips"></div>
+        </div>
+        <button id="run-button" class="primary">Run</button>
+      </div>
+    </div>
+    <div class="status-strip" id="status-strip">Idle.</div>
+  </section>
+
+  <section class="workspace">
+    <div class="todo-panel" id="todo-panel">
+      <div class="panel-header">
+        <span>To-dos <span class="count" id="todo-count">0</span></span>
+        <span class="complete-badge" id="complete-badge" hidden>✓ Complete</span>
+      </div>
+      <ul class="task-list" id="task-list">
+        <li class="empty-state">Tasks will appear here once planning finishes.</li>
+      </ul>
+    </div>
+
+    <div class="activity-panel">
+      <div class="panel-header">
+        <span>Activity</span>
+        <label class="pause-toggle">
+          <input type="checkbox" id="pause-scroll" /> Pause autoscroll
+        </label>
+      </div>
+      <div class="activity-feed" id="activity-feed"></div>
+    </div>
+  </section>
+
+  <section class="report" id="report-section" hidden>
+    <details class="verification" id="verification-block" hidden>
+      <summary>⚠ Verification notes</summary>
+      <div id="verification-body"></div>
+    </details>
+    <article class="report-body" id="report-body"></article>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
