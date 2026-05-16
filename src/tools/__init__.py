@@ -16,8 +16,8 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from src.logging_setup import Events, get_logger
-from src.tools.base import ToolError, ToolSpec
-from src.tools.fetch_url import current_session_id, fetch_url_spec
+from src.tools.base import ToolError, ToolSpec, current_session_id
+from src.tools.fetch_url import fetch_url_spec
 from src.tools.finish_task import finish_task_spec
 from src.tools.search_documents import search_documents_spec
 from src.tools.search_memory import search_memory_spec

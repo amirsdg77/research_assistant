@@ -22,7 +22,7 @@ from src import memory as memory_mod
 from src.memory import InMemoryStubStore
 from src.tools import invoke, openai_schemas_for
 from src.tools.base import ToolError
-from src.tools.fetch_url import current_session_id
+from src.tools.base import current_session_id
 from src.tools.finish_task import finish_task_spec
 from src.tools.web_search import WebSearchInput
 

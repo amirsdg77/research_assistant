@@ -57,6 +57,19 @@ class EventTypes:
     _CLOSE = "__close__"
 
 
+_CRITICAL_TYPES = frozenset({
+    EventTypes.PLAN_READY,
+    EventTypes.TASK_STATUS_CHANGED,
+    EventTypes.REPORT_READY,
+    EventTypes.VERIFICATION_READY,
+    EventTypes.SESSION_STARTED,
+    EventTypes.SESSION_COMPLETED,
+    EventTypes.SESSION_FAILED,
+    EventTypes.GUARDRAIL_TRIGGERED,
+    EventTypes._CLOSE,
+})
+
+
 @dataclass
 class AgentEvent:
     """A single event flowing from the agent loop to subscribers."""
@@ -65,6 +78,10 @@ class AgentEvent:
     type: str
     data: dict[str, Any] = field(default_factory=dict)
     ts: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+
+    @property
+    def critical(self) -> bool:
+        return self.type in _CRITICAL_TYPES
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -112,28 +129,58 @@ class EventBus:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                # Drop oldest to make room. The subscriber falls one event
-                # behind but stays connected — far better than disconnect.
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                try:
-                    queue.put_nowait(event)
-                except asyncio.QueueFull:  # pragma: no cover — defense in depth
-                    log.warning(
-                        "event.dropped_after_evict",
-                        session_id=str(event.session_id),
-                        sub_id=str(sub_id),
-                        type=event.type,
-                    )
-                else:
-                    log.info(
-                        "event.evicted_oldest",
-                        session_id=str(event.session_id),
-                        sub_id=str(sub_id),
-                        type=event.type,
-                    )
+                self._evict_and_put(queue, event, sub_id)
+
+    def _evict_and_put(
+        self,
+        queue: asyncio.Queue[AgentEvent],
+        event: AgentEvent,
+        sub_id: UUID,
+    ) -> None:
+        """Make room by dropping the oldest non-critical event, then enqueue.
+
+        If every queued event is critical (rare), drop the oldest of those.
+        Falling behind is preferable to disconnecting the subscriber.
+        """
+        buffered: list[AgentEvent] = []
+        try:
+            while True:
+                buffered.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            pass
+
+        drop_idx: int | None = None
+        for i, ev in enumerate(buffered):
+            if not ev.critical:
+                drop_idx = i
+                break
+        if drop_idx is None and buffered:
+            drop_idx = 0
+        dropped = buffered.pop(drop_idx) if drop_idx is not None else None
+
+        for ev in buffered:
+            try:
+                queue.put_nowait(ev)
+            except asyncio.QueueFull:  # pragma: no cover
+                break
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:  # pragma: no cover
+            log.warning(
+                "event.dropped_after_evict",
+                session_id=str(event.session_id),
+                sub_id=str(sub_id),
+                type=event.type,
+            )
+            return
+        if dropped is not None:
+            log.info(
+                "event.evicted",
+                session_id=str(event.session_id),
+                sub_id=str(sub_id),
+                evicted_type=dropped.type,
+                evicted_critical=dropped.critical,
+            )
 
     @asynccontextmanager
     async def subscribe(

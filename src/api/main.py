@@ -18,8 +18,10 @@ from sqlalchemy import text
 from src.api.routes import router as api_router
 from src.bootstrap import setup as bootstrap_setup
 from src.db import engine
+from src.llm import shutdown as llm_shutdown
 from src.logging_setup import bind_request, get_logger
 from src.prompts import ALL_PROMPTS
+from src.tools.web_search import shutdown as web_search_shutdown
 
 
 log = get_logger(__name__)
@@ -31,12 +33,15 @@ _STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     bootstrap_setup()
     log.info("app.startup", version=app.version)
-    # Importing src.prompts already validated all prompts exist (it loads them
-    # at import time). Log their sizes so we can spot accidental empties.
     for name, body in ALL_PROMPTS.items():
         log.info("prompt.loaded", name=name, bytes=len(body))
-    yield
-    log.info("app.shutdown")
+    try:
+        yield
+    finally:
+        log.info("app.shutdown")
+        await llm_shutdown()
+        await web_search_shutdown()
+        await engine.dispose()
 
 
 app = FastAPI(title="Research Agent", version="0.1.0", lifespan=lifespan)

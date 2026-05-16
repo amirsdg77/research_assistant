@@ -18,6 +18,7 @@ Why model routing lives here:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -86,6 +87,24 @@ def get_client() -> AsyncOpenAI:
             )
         _client = AsyncOpenAI(api_key=settings.openai_api_key)
     return _client
+
+
+async def shutdown() -> None:
+    global _client, _LLM_LOG_TASK, _LLM_LOG_QUEUE
+    if _LLM_LOG_TASK is not None:
+        _LLM_LOG_TASK.cancel()
+        try:
+            await _LLM_LOG_TASK
+        except (asyncio.CancelledError, Exception):
+            pass
+        _LLM_LOG_TASK = None
+    _LLM_LOG_QUEUE = None
+    if _client is not None:
+        try:
+            await _client.close()
+        except Exception:  # pragma: no cover
+            pass
+        _client = None
 
 
 def model_for(purpose: LLMPurpose) -> str:
@@ -268,6 +287,47 @@ def _truncate_for_jsonb(payload: Any) -> Any:
     }
 
 
+_LLM_LOG_QUEUE: asyncio.Queue[LLMCall] | None = None
+_LLM_LOG_TASK: asyncio.Task | None = None
+_LLM_LOG_BATCH_SIZE = 16
+_LLM_LOG_FLUSH_INTERVAL = 1.0
+
+
+def _ensure_llm_log_worker() -> asyncio.Queue[LLMCall]:
+    global _LLM_LOG_QUEUE, _LLM_LOG_TASK
+    if _LLM_LOG_QUEUE is None:
+        _LLM_LOG_QUEUE = asyncio.Queue()
+    if _LLM_LOG_TASK is None or _LLM_LOG_TASK.done():
+        _LLM_LOG_TASK = asyncio.create_task(_drain_llm_log())
+    return _LLM_LOG_QUEUE
+
+
+async def _drain_llm_log() -> None:
+    assert _LLM_LOG_QUEUE is not None
+    while True:
+        batch: list[LLMCall] = []
+        try:
+            first = await _LLM_LOG_QUEUE.get()
+            batch.append(first)
+        except asyncio.CancelledError:
+            return
+        deadline = asyncio.get_event_loop().time() + _LLM_LOG_FLUSH_INTERVAL
+        while len(batch) < _LLM_LOG_BATCH_SIZE:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                row = await asyncio.wait_for(_LLM_LOG_QUEUE.get(), timeout=remaining)
+                batch.append(row)
+            except asyncio.TimeoutError:
+                break
+        try:
+            async with session_scope() as db:
+                db.add_all(batch)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("llm.db_log_failed", error=str(exc), batch_size=len(batch))
+
+
 async def _log_llm_call_safely(
     *,
     purpose: LLMPurpose,
@@ -281,7 +341,6 @@ async def _log_llm_call_safely(
     task_id: UUID | None,
 ) -> None:
     try:
-        # Build a JSON-serializable response payload from the raw message.
         response_payload: dict[str, Any] = {
             "content": response_message.content,
             "tool_calls": [
@@ -295,20 +354,19 @@ async def _log_llm_call_safely(
         }
         prompt_payload = {"messages": messages, "tools": tools}
 
-        async with session_scope() as db:
-            db.add(
-                LLMCall(
-                    session_id=session_id,
-                    task_id=task_id,
-                    purpose=purpose,
-                    model=model,
-                    input_tokens=getattr(usage, "prompt_tokens", None),
-                    output_tokens=getattr(usage, "completion_tokens", None),
-                    latency_ms=latency_ms,
-                    prompt=_truncate_for_jsonb(prompt_payload),
-                    response=_truncate_for_jsonb(response_payload),
-                )
-            )
+        row = LLMCall(
+            session_id=session_id,
+            task_id=task_id,
+            purpose=purpose,
+            model=model,
+            input_tokens=getattr(usage, "prompt_tokens", None),
+            output_tokens=getattr(usage, "completion_tokens", None),
+            latency_ms=latency_ms,
+            prompt=_truncate_for_jsonb(prompt_payload),
+            response=_truncate_for_jsonb(response_payload),
+        )
+        queue = _ensure_llm_log_worker()
+        queue.put_nowait(row)
     except Exception as exc:  # pragma: no cover — defensive
         log.warning("llm.db_log_failed", error=str(exc), purpose=purpose.value)
 

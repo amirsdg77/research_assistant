@@ -23,6 +23,7 @@ so the SSE channel and the activity feed can render in real time.
 from __future__ import annotations
 
 import asyncio
+import enum
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -47,7 +48,7 @@ from src.models import (
     TaskStatus,
 )
 from src.prompts import EXECUTOR_SYSTEM, PLANNER_SYSTEM, SYNTHESIZER_SYSTEM
-from src.schemas import Plan
+from src.schemas import Plan, TaskDTO, openai_function_from_model
 from src.tools.base import ToolError
 
 
@@ -56,59 +57,41 @@ log = get_logger(__name__)
 
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 
+_SESSION_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_session_semaphore() -> asyncio.Semaphore:
+    global _SESSION_SEMAPHORE
+    if _SESSION_SEMAPHORE is None:
+        _SESSION_SEMAPHORE = asyncio.Semaphore(settings.max_concurrent_sessions)
+    return _SESSION_SEMAPHORE
+
 
 def _count_tokens(text: str) -> int:
-    return len(_ENCODER.encode(text or ""))
+    return len(_ENCODER.encode(text))
 
 
-def _count_messages(messages: list[dict[str, Any]]) -> int:
+def _count_message_tokens(m: dict[str, Any]) -> int:
     total = 0
-    for m in messages:
-        # Approximate: serialize content + role + tool fields. Off by single-
-        # digit tokens per message vs. the official method, plenty good for
-        # budgeting.
-        content = m.get("content")
-        if isinstance(content, str):
-            total += _count_tokens(content)
-        total += _count_tokens(str(m.get("role", "")))
-        if "tool_calls" in m and m["tool_calls"]:
-            total += _count_tokens(str(m["tool_calls"]))
-        if "name" in m:
-            total += _count_tokens(str(m["name"]))
+    content = m.get("content")
+    if isinstance(content, str):
+        total += _count_tokens(content)
+    total += _count_tokens(str(m.get("role", "")))
+    if "tool_calls" in m and m["tool_calls"]:
+        total += _count_tokens(str(m["tool_calls"]))
+    if "name" in m:
+        total += _count_tokens(str(m["name"]))
     return total
 
 
 # --- Plan schema (forced function) -----------------------------------------
 
 
-_CREATE_PLAN_FUNCTION = {
-    "type": "function",
-    "function": {
-        "name": "create_plan",
-        "description": "Emit a structured research plan of 3-7 sub-questions.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "minItems": 3,
-                    "maxItems": 7,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "description": {"type": "string", "maxLength": 500},
-                            "rationale": {"type": "string", "maxLength": 500},
-                        },
-                        "required": ["description", "rationale"],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            "required": ["tasks"],
-            "additionalProperties": False,
-        },
-    },
-}
+_CREATE_PLAN_FUNCTION = openai_function_from_model(
+    Plan,
+    name="create_plan",
+    description="Emit a structured research plan of 3-7 sub-questions.",
+)
 
 
 # --- Entry point -----------------------------------------------------------
@@ -134,20 +117,22 @@ async def run_session(
                 data={"goal": goal, "resume": resume},
             )
         )
-        try:
-            await _run_session_inner(goal, session_id, resume=resume)
-        except Exception as exc:
-            log.exception(Events.SESSION_FAILED, error=str(exc))
-            await _set_session_status(session_id, SessionStatus.failed)
-            await bus.publish(
-                AgentEvent(
-                    session_id=session_id,
-                    type=EventTypes.SESSION_FAILED,
-                    data={"error": str(exc)},
+        sem = _get_session_semaphore()
+        async with sem:
+            try:
+                await _run_session_inner(goal, session_id, resume=resume)
+            except Exception as exc:
+                log.exception(Events.SESSION_FAILED, error=str(exc))
+                await _set_session_status(session_id, SessionStatus.failed)
+                await bus.publish(
+                    AgentEvent(
+                        session_id=session_id,
+                        type=EventTypes.SESSION_FAILED,
+                        data={"error": str(exc)},
+                    )
                 )
-            )
-        finally:
-            await bus.close_session(session_id)
+            finally:
+                await bus.close_session(session_id)
 
 
 async def _run_session_inner(
@@ -165,12 +150,26 @@ async def _run_session_inner(
                     data={"check": "check_goal", "reason": guard.reason},
                 )
             )
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.SESSION_FAILED,
+                    data={"error": guard.reason or "guardrail rejected goal"},
+                )
+            )
             return
 
     # --- Phase 1: planning
     plan_tasks = await _plan_or_load(goal, session_id, resume=resume)
     if not plan_tasks:
         await _set_session_status(session_id, SessionStatus.failed)
+        await bus.publish(
+            AgentEvent(
+                session_id=session_id,
+                type=EventTypes.SESSION_FAILED,
+                data={"error": "planning failed to produce tasks"},
+            )
+        )
         return
 
     # --- Phase 2: execution
@@ -217,6 +216,13 @@ async def _run_session_inner(
     report = await _synthesize(goal, completed_summaries, session_id)
     if not report:
         await _set_session_status(session_id, SessionStatus.failed)
+        await bus.publish(
+            AgentEvent(
+                session_id=session_id,
+                type=EventTypes.SESSION_FAILED,
+                data={"error": "synthesis produced no report"},
+            )
+        )
         return
 
     async with session_scope() as db:
@@ -267,7 +273,7 @@ async def _run_session_inner(
 
 async def _plan_or_load(
     goal: str, session_id: UUID, *, resume: bool
-) -> list[Task]:
+) -> list[TaskDTO]:
     """Return tasks in order. Plans only if this is a fresh session or resume
     finds an empty plan."""
     if resume:
@@ -300,7 +306,7 @@ async def _plan_or_load(
         )
     except Exception as exc:
         log.exception("plan.failed", error=str(exc))
-        return []
+        raise RuntimeError(f"planning call failed: {exc}") from exc
 
     plan = _parse_plan_response(response)
     if not plan or not plan.tasks:
@@ -341,7 +347,7 @@ def _parse_plan_response(response) -> Plan | None:
         return None
 
 
-async def _persist_plan(session_id: UUID, plan: Plan) -> list[Task]:
+async def _persist_plan(session_id: UUID, plan: Plan) -> list[TaskDTO]:
     async with session_scope() as db:
         rows = [
             Task(
@@ -353,19 +359,8 @@ async def _persist_plan(session_id: UUID, plan: Plan) -> list[Task]:
             for i, t in enumerate(plan.tasks)
         ]
         db.add_all(rows)
-        await db.flush()  # populate ids
-        # Detach by capturing field values; SQLAlchemy will close the session.
-        captured = [
-            Task(
-                id=r.id,
-                session_id=r.session_id,
-                order_index=r.order_index,
-                description=r.description,
-                status=r.status,
-            )
-            for r in rows
-        ]
-    return captured
+        await db.flush()
+        return [TaskDTO.model_validate(r) for r in rows]
 
 
 # --- Phase 2: per-task execution -------------------------------------------
@@ -490,13 +485,14 @@ async def _inner_tool_loop(
     tools = tools_pkg.openai_schemas_for(_EXECUTOR_TOOL_NAMES)
 
     exchanges: list[_ToolExchange] = []
+    scratch_lines: list[str] = []
     correction_attempts = 0
     max_iters = settings.max_tool_iterations_per_task
 
     for iteration in range(max_iters):
         log.info(Events.TASK_TOOL_ITERATION, iteration=iteration)
 
-        ctx = _build_context_window(messages, exchanges)
+        ctx = _build_context_window(messages, exchanges, scratch_lines)
         response = await complete(
             purpose=LLMPurpose.decide,
             messages=ctx,
@@ -546,6 +542,13 @@ async def _inner_tool_loop(
                 assistant_message=assistant_msg, tool_messages=tool_results_to_messages(tool_results)
             )
         )
+        if len(exchanges) > _TOOL_EXCHANGES_VERBATIM:
+            aged = exchanges.pop(0)
+            for tm in aged.tool_messages:
+                name = tm.get("name", "tool")
+                content = tm.get("content", "")
+                hint = content[:200].replace("\n", " ")
+                scratch_lines.append(f"- {name}: {hint}")
 
     log.info("task.iterations_exhausted", iterations=max_iters)
     return False
@@ -557,46 +560,43 @@ async def _inner_tool_loop(
 def _build_context_window(
     base_messages: list[dict[str, Any]],
     exchanges: list[_ToolExchange],
+    scratch_lines: list[str],
 ) -> list[dict[str, Any]]:
     """Stitch base + recent exchanges into a budget-bounded prompt.
 
-    Recent exchanges (last 3) are appended verbatim. Older exchanges are
-    folded into a single synthetic 'scratchpad' assistant message that
-    summarizes what's already been tried. If the result still exceeds the
+    Recent exchanges (capped at _TOOL_EXCHANGES_VERBATIM) are appended verbatim.
+    `scratch_lines` (built incrementally as exchanges age out) becomes a single
+    synthetic 'scratchpad' assistant message. If the result still exceeds the
     token budget, oldest non-essential items are dropped and we log
     `context.truncated`.
     """
     out = list(base_messages)
+    counts = [_count_message_tokens(m) for m in out]
 
-    older = exchanges[: max(0, len(exchanges) - _TOOL_EXCHANGES_VERBATIM)]
-    recent = exchanges[-_TOOL_EXCHANGES_VERBATIM:]
+    if scratch_lines:
+        scratch = {
+            "role": "assistant",
+            "content": "Earlier tool activity (summarized):\n" + "\n".join(scratch_lines),
+        }
+        out.append(scratch)
+        counts.append(_count_message_tokens(scratch))
 
-    if older:
-        scratch_lines: list[str] = ["Earlier tool activity (summarized):"]
-        for ex in older:
-            for tm in ex.tool_messages:
-                name = tm.get("name", "tool")
-                # Tool messages carry JSON content; collapse to a short hint
-                # to avoid bloating the scratchpad with raw payloads.
-                content = tm.get("content", "")
-                hint = content[:200].replace("\n", " ")
-                scratch_lines.append(f"- {name}: {hint}")
-        out.append({"role": "assistant", "content": "\n".join(scratch_lines)})
-
-    for ex in recent:
+    for ex in exchanges:
         out.append(ex.assistant_message)
-        out.extend(ex.tool_messages)
+        counts.append(_count_message_tokens(ex.assistant_message))
+        for tm in ex.tool_messages:
+            out.append(tm)
+            counts.append(_count_message_tokens(tm))
 
-    # Budget enforcement: drop the scratchpad first (if present), then drop
-    # oldest recent exchanges one by one.
+    total = sum(counts)
     budget = settings.token_budget_per_call
-    while _count_messages(out) > budget and len(out) > 2:
-        # Skip the system + initial user (indices 0, 1); drop the next item.
+    while total > budget and len(out) > 2:
         truncated = out.pop(2)
+        total -= counts.pop(2)
         log.info(
             Events.CONTEXT_TRUNCATED,
             dropped_role=truncated.get("role"),
-            tokens_after=_count_messages(out),
+            tokens_after=total,
         )
 
     return out
@@ -625,13 +625,13 @@ def _truncate_to_tokens(text: str, max_tokens: int) -> str:
 # --- Tool dispatch helpers -------------------------------------------------
 
 
-class _FinishOutcome:
+class _FinishOutcome(enum.Enum):
     SUCCESS = "success"
     CORRECTION_REQUIRED = "correction_required"
     NOT_PRESENT = "not_present"
 
 
-def _check_finish(calls, results) -> str:
+def _check_finish(calls, results) -> _FinishOutcome:
     """Did this turn call finish_task? Was it accepted? Did it need correction?"""
     for call, result in zip(calls, results):
         if call.name != "finish_task":
@@ -811,25 +811,12 @@ async def _synthesize(
 # --- DB helpers ------------------------------------------------------------
 
 
-async def _load_tasks(session_id: UUID) -> list[Task]:
+async def _load_tasks(session_id: UUID) -> list[TaskDTO]:
     async with session_scope() as db:
         result = await db.execute(
             select(Task).where(Task.session_id == session_id).order_by(Task.order_index)
         )
-        rows = result.scalars().all()
-        # Detach.
-        return [
-            Task(
-                id=r.id,
-                session_id=r.session_id,
-                order_index=r.order_index,
-                description=r.description,
-                status=r.status,
-                result_summary=r.result_summary,
-                sources=r.sources,
-            )
-            for r in rows
-        ]
+        return [TaskDTO.model_validate(r) for r in result.scalars().all()]
 
 
 async def _list_session_documents(session_id: UUID) -> list[str]:

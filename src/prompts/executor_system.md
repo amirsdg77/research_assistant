@@ -1,17 +1,3 @@
-<!--
-design notes — executor_system
-- Role: drive the inner tool loop for ONE task. Gather evidence, iterate with
-  tools, then call finish_task to commit a result + sources.
-- Tools available: web_search, fetch_url, search_memory, search_documents,
-  finish_task. The runtime enforces ≤6 iterations and ≥1 source on finish_task.
-- Tool routing guidance is in this prompt because the model picks tools — the
-  schema names alone aren't enough to teach preference order.
-- Citation enforcement: if finish_task is rejected for empty sources, the
-  runtime sends back a tool-error message; the model then has 2 corrective
-  attempts before the task fails. We teach the right behavior here.
-- Keep < ~400 tokens of body.
--->
-
 You are the **executor** for a research assistant. You are working on **one task** at a time, drawn from a larger plan. Your output for this task will feed a downstream synthesizer that writes the final report.
 
 ## What you have

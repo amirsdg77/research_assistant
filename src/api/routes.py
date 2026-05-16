@@ -93,19 +93,22 @@ async def _ingest_uploads(
     """Ingest a batch of uploaded files. Errors raise HTTPException."""
     out: list[dict] = []
     for f in files:
-        data = await f.read()
         try:
-            result = await ingest_document(
-                filename=f.filename or "untitled",
-                data=data,
-                session_id=session_id,
-                content_type=f.content_type,
-            )
-        except IngestError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{f.filename}: {exc}",
-            )
+            data = await f.read()
+            try:
+                result = await ingest_document(
+                    filename=f.filename or "untitled",
+                    data=data,
+                    session_id=session_id,
+                    content_type=f.content_type,
+                )
+            except IngestError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"{f.filename}: {exc}",
+                )
+        finally:
+            await f.close()
         out.append(
             {
                 "document_id": str(result.document_id),
@@ -198,15 +201,23 @@ async def session_events(session_id: UUID, request: Request) -> StreamingRespons
     async def _gen() -> AsyncIterator[bytes]:
         async with bus.subscribe(session_id) as queue:
             while True:
-                # Use a timeout so we can periodically check disconnection.
+                get_task = asyncio.create_task(queue.get())
                 try:
-                    event: AgentEvent = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
+                    done, _pending = await asyncio.wait({get_task}, timeout=15.0)
+                except asyncio.CancelledError:
+                    get_task.cancel()
+                    raise
+                if not done:
+                    get_task.cancel()
+                    try:
+                        await get_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     if await request.is_disconnected():
                         return
-                    # Heartbeat keeps proxies from closing idle connections.
                     yield b": keepalive\n\n"
                     continue
+                event: AgentEvent = get_task.result()
 
                 if event.type == EventTypes._CLOSE:
                     return

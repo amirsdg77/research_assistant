@@ -158,8 +158,8 @@ function dispatch(type, event) {
       appendTaskToolLine(data.task_id, data.tool, "completed");
       break;
     case "tool.failed":
-      appendFeed("error", data.tool, data.error || "failed");
-      appendTaskToolLine(data.task_id, data.tool, "failed");
+      appendFeed("warn", data.tool, data.error || "retrying");
+      appendTaskToolLine(data.task_id, data.tool, "retrying", "warn");
       break;
     case "report.ready":
       renderReport(data.report || "");
@@ -240,12 +240,11 @@ function updateTaskStatus(taskId, status, error) {
   }
 }
 
-function appendTaskToolLine(taskId, tool, kind) {
+function appendTaskToolLine(taskId, tool, kind, cls) {
   const row = els.taskList.querySelector(`[data-task-id="${taskId}"]`);
   if (!row) return;
   const lines = row.querySelector(".tool-lines");
-  const cls = kind === "failed" ? "failed" : "";
-  appendTagged(lines, cls, tool, kind);
+  appendTagged(lines, cls || "", tool, kind);
 }
 
 function appendTagged(container, cls, tool, label) {

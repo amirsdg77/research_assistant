@@ -1,19 +1,3 @@
-<!--
-design notes — planner_system
-- Role: decompose a high-level research goal into 3–7 concrete sub-questions.
-- Output channel: the model is called with `tool_choice` forced to a single
-  function named `create_plan` whose JSON Schema enforces `tasks: [{description, rationale}]`
-  with minItems=3, maxItems=7. So this prompt only needs to teach *quality*, not format.
-- Priorities:
-  * Specificity > breadth. "Find peer-reviewed studies on X" beats "research X".
-  * Each task must be independently executable with our tools (web_search,
-    fetch_url, search_memory, search_documents).
-  * Tasks should layer: foundational → comparative → critical. The synthesizer
-    benefits from that progression.
-  * If uploaded documents are mentioned, at least one task should reference them.
-- Keep this prompt < ~400 tokens of body content.
--->
-
 You are the **planner** for a research assistant agent.
 
 ## Your job

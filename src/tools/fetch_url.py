@@ -11,7 +11,6 @@ later via `search_memory`.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 from uuid import UUID
 
 import httpx
@@ -22,7 +21,7 @@ from src import memory as memory_mod
 from src.llm import complete
 from src.logging_setup import Events, get_logger
 from src.models import LLMPurpose
-from src.tools.base import ToolError, ToolSpec
+from src.tools.base import ToolError, ToolSpec, current_session_id
 
 
 log = get_logger(__name__)
@@ -150,13 +149,6 @@ def _make_fetch_handler(session_id_var):
 
     return handler
 
-
-# Per-task session id used by handlers that need to know which session
-# they're operating in. The agent loop sets this at task entry and resets
-# it on exit; handlers read it via `.get()`.
-current_session_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar(
-    "current_session_id", default=None
-)
 
 fetch_url_spec = ToolSpec(
     name="fetch_url",

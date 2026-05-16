@@ -339,7 +339,7 @@ async def test_ingest_refuses_when_store_is_stub(monkeypatch, stub_db_session):
 async def test_search_documents_without_session_raises():
     from src.tools import invoke
     from src.tools.base import ToolError
-    from src.tools.fetch_url import current_session_id
+    from src.tools.base import current_session_id
 
     assert current_session_id.get() is None
     with pytest.raises(ToolError):
@@ -349,7 +349,7 @@ async def test_search_documents_without_session_raises():
 async def test_search_documents_returns_hits_with_metadata(monkeypatch):
     from src.memory import MemoryChunk
     from src.tools import invoke
-    from src.tools.fetch_url import current_session_id
+    from src.tools.base import current_session_id
 
     async def _fake_search(*, session_id, query, k=5):
         return [
@@ -386,7 +386,7 @@ async def test_search_documents_returns_hits_with_metadata(monkeypatch):
 async def test_search_documents_handles_missing_page_metadata(monkeypatch):
     from src.memory import MemoryChunk
     from src.tools import invoke
-    from src.tools.fetch_url import current_session_id
+    from src.tools.base import current_session_id
 
     async def _fake_search(*, session_id, query, k=5):
         return [

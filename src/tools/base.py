@@ -14,10 +14,17 @@ model verbatim — that's what powers the self-correction loop.
 """
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
+from uuid import UUID
 
 from pydantic import BaseModel
+
+
+current_session_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar(
+    "current_session_id", default=None
+)
 
 
 class ToolError(Exception):

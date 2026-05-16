@@ -18,7 +18,12 @@ from src.logging_setup import Events, get_logger
 from src.models import LLMPurpose
 from src.prompts import VERIFIER_SYSTEM
 from src.llm import complete
-from src.schemas import GuardrailResult, VerificationResult
+from src.schemas import (
+    GuardrailResult,
+    ReportVerificationArgs,
+    VerificationResult,
+    openai_function_from_model,
+)
 
 
 log = get_logger(__name__)
@@ -103,39 +108,14 @@ async def check_goal(goal: str) -> GuardrailResult:
 # constrained server-side; we still validate the result with Pydantic.
 
 
-_REPORT_VERIFICATION_FUNCTION = {
-    "type": "function",
-    "function": {
-        "name": "report_verification",
-        "description": (
-            "Return a structured verification of the report. List any claims "
-            "not supported by the provided source summaries."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "unsupported_claims": {
-                    "type": "array",
-                    "items": {"type": "string", "maxLength": 500},
-                    "description": (
-                        "Short (<200 char) quoted or paraphrased fragments "
-                        "of report claims that aren't backed by the source "
-                        "summaries. Empty list means the report is clean."
-                    ),
-                },
-                "notes": {
-                    "type": "string",
-                    "maxLength": 1000,
-                    "description": (
-                        "One to three sentences of overall assessment."
-                    ),
-                },
-            },
-            "required": ["unsupported_claims", "notes"],
-            "additionalProperties": False,
-        },
-    },
-}
+_REPORT_VERIFICATION_FUNCTION = openai_function_from_model(
+    ReportVerificationArgs,
+    name="report_verification",
+    description=(
+        "Return a structured verification of the report. List any claims "
+        "not supported by the provided source summaries."
+    ),
+)
 
 
 async def verify_report(

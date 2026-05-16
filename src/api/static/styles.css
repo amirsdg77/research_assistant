@@ -300,6 +300,8 @@ html, body {
   margin-top: 6px;
 }
 .drawer-section:first-child { margin-top: 0; }
+.tool-line.warn .tool-name { color: var(--warn); }
+
 .tool-line {
   font-family: var(--mono);
   font-size: 11px;
@@ -342,6 +344,7 @@ html, body {
 .feed-line.tool   .tag { color: var(--success); }
 .feed-line.llm    .tag { color: var(--accent); }
 .feed-line.status .tag { color: var(--warn); }
+.feed-line.warn   .tag { color: var(--warn); }
 .feed-line.error  .tag { color: var(--error); }
 .feed-line .tag { font-weight: 600; margin-right: 6px; }
 
