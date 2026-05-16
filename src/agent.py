@@ -1,0 +1,871 @@
+"""The agent loop.
+
+run_session(goal, session_id, resume=False) orchestrates the whole flow:
+
+  Phase 0 — input guardrail
+  Phase 1 — planning (one LLM call → 3-7 tasks persisted)
+  Phase 2 — execution loop (per-task inner tool loop)
+  Phase 3 — synthesis (markdown report with inline citations)
+  Phase 4 — output guardrail (verifier flags unsupported claims)
+
+Context strategy (the rules this module enforces):
+- LLM input budget capped at TOKEN_BUDGET_PER_CALL (counted with cl100k_base).
+- Full page contents NEVER enter LLM context; only fetch_url's auto-summary
+  + memory_id flow through. Cross-task and cross-source memory lives in
+  the vector store, retrieved per-task.
+- Completed-task context is summary-only.
+- Inner tool loop keeps the last 3 tool exchanges verbatim and summarizes
+  older ones into a scratchpad before re-calling the model.
+
+The loop emits structured log events and AgentEvents at every transition
+so the SSE channel and the activity feed can render in real time.
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
+
+import tiktoken
+from pydantic import ValidationError
+from sqlalchemy import select
+
+from src import tools as tools_pkg
+from src.config import settings
+from src.db import session_scope
+from src.events import AgentEvent, EventTypes, bus
+from src.guardrails import check_goal, verify_report
+from src.llm import complete
+from src.logging_setup import Events, bind_session, bind_task, get_logger
+from src.models import (
+    Document,
+    LLMPurpose,
+    Session,
+    SessionStatus,
+    Task,
+    TaskStatus,
+)
+from src.prompts import EXECUTOR_SYSTEM, PLANNER_SYSTEM, SYNTHESIZER_SYSTEM
+from src.schemas import Plan
+from src.tools.base import ToolError
+
+
+log = get_logger(__name__)
+
+
+_ENCODER = tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(text: str) -> int:
+    return len(_ENCODER.encode(text or ""))
+
+
+def _count_messages(messages: list[dict[str, Any]]) -> int:
+    total = 0
+    for m in messages:
+        # Approximate: serialize content + role + tool fields. Off by single-
+        # digit tokens per message vs. the official method, plenty good for
+        # budgeting.
+        content = m.get("content")
+        if isinstance(content, str):
+            total += _count_tokens(content)
+        total += _count_tokens(str(m.get("role", "")))
+        if "tool_calls" in m and m["tool_calls"]:
+            total += _count_tokens(str(m["tool_calls"]))
+        if "name" in m:
+            total += _count_tokens(str(m["name"]))
+    return total
+
+
+# --- Plan schema (forced function) -----------------------------------------
+
+
+_CREATE_PLAN_FUNCTION = {
+    "type": "function",
+    "function": {
+        "name": "create_plan",
+        "description": "Emit a structured research plan of 3-7 sub-questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 7,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string", "maxLength": 500},
+                            "rationale": {"type": "string", "maxLength": 500},
+                        },
+                        "required": ["description", "rationale"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["tasks"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+# --- Entry point -----------------------------------------------------------
+
+
+async def run_session(
+    goal: str, session_id: UUID, *, resume: bool = False
+) -> None:
+    """Drive a session from start to verification.
+
+    Always returns; failures are caught and persisted as session status
+    `failed` so the UI can render an end state. Exceptions inside individual
+    tasks fail that task only, not the whole session.
+    """
+    with bind_session(session_id):
+        log.info(
+            Events.SESSION_RESUMED if resume else Events.SESSION_STARTED, goal=goal
+        )
+        await bus.publish(
+            AgentEvent(
+                session_id=session_id,
+                type=EventTypes.SESSION_STARTED,
+                data={"goal": goal, "resume": resume},
+            )
+        )
+        try:
+            await _run_session_inner(goal, session_id, resume=resume)
+        except Exception as exc:
+            log.exception(Events.SESSION_FAILED, error=str(exc))
+            await _set_session_status(session_id, SessionStatus.failed)
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.SESSION_FAILED,
+                    data={"error": str(exc)},
+                )
+            )
+        finally:
+            await bus.close_session(session_id)
+
+
+async def _run_session_inner(
+    goal: str, session_id: UUID, *, resume: bool
+) -> None:
+    # --- Phase 0: input guardrail (skip on resume; goal was already accepted)
+    if not resume:
+        guard = await check_goal(goal)
+        if not guard.passed:
+            await _set_session_status(session_id, SessionStatus.failed)
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.GUARDRAIL_TRIGGERED,
+                    data={"check": "check_goal", "reason": guard.reason},
+                )
+            )
+            return
+
+    # --- Phase 1: planning
+    plan_tasks = await _plan_or_load(goal, session_id, resume=resume)
+    if not plan_tasks:
+        await _set_session_status(session_id, SessionStatus.failed)
+        return
+
+    # --- Phase 2: execution
+    await _set_session_status(session_id, SessionStatus.running)
+    completed_summaries: list[tuple[str, str, list[str]]] = []  # (description, summary, sources)
+
+    for task_row in plan_tasks:
+        # Preload already-completed task summaries so resume picks up cleanly.
+        if task_row.status == TaskStatus.done and task_row.result_summary:
+            completed_summaries.append(
+                (
+                    task_row.description,
+                    task_row.result_summary,
+                    list(task_row.sources or []),
+                )
+            )
+            continue
+
+        # Resume: restart anything that was in_progress.
+        if task_row.status == TaskStatus.in_progress:
+            await _set_task_status(task_row.id, TaskStatus.pending)
+
+        ok = await _execute_task(
+            session_id=session_id,
+            task_id=task_row.id,
+            goal=goal,
+            task_description=task_row.description,
+            completed=completed_summaries,
+        )
+        if ok:
+            # Reload the freshly-committed summary so synthesis sees it.
+            async with session_scope() as db:
+                refreshed = await db.get(Task, task_row.id)
+                if refreshed and refreshed.result_summary:
+                    completed_summaries.append(
+                        (
+                            refreshed.description,
+                            refreshed.result_summary,
+                            list(refreshed.sources or []),
+                        )
+                    )
+
+    # --- Phase 3: synthesis
+    report = await _synthesize(goal, completed_summaries, session_id)
+    if not report:
+        await _set_session_status(session_id, SessionStatus.failed)
+        return
+
+    async with session_scope() as db:
+        sess = await db.get(Session, session_id)
+        if sess:
+            sess.final_report = report
+    await bus.publish(
+        AgentEvent(
+            session_id=session_id,
+            type=EventTypes.REPORT_READY,
+            data={"report": report},
+        )
+    )
+
+    # --- Phase 4: output guardrail (informational)
+    summaries_only = [s for (_d, s, _u) in completed_summaries]
+    verification = await verify_report(report, summaries_only)
+    async with session_scope() as db:
+        sess = await db.get(Session, session_id)
+        if sess:
+            notes = verification.notes or ""
+            if verification.unsupported_claims:
+                bullets = "\n".join(f"- {c}" for c in verification.unsupported_claims)
+                notes = f"{notes}\n\n{bullets}".strip()
+            sess.verification_notes = notes or None
+    await bus.publish(
+        AgentEvent(
+            session_id=session_id,
+            type=EventTypes.VERIFICATION_READY,
+            data={
+                "unsupported_claims": verification.unsupported_claims,
+                "notes": verification.notes,
+            },
+        )
+    )
+
+    await _set_session_status(session_id, SessionStatus.completed)
+    log.info(Events.SESSION_COMPLETED)
+    await bus.publish(
+        AgentEvent(
+            session_id=session_id, type=EventTypes.SESSION_COMPLETED, data={}
+        )
+    )
+
+
+# --- Phase 1: planning -----------------------------------------------------
+
+
+async def _plan_or_load(
+    goal: str, session_id: UUID, *, resume: bool
+) -> list[Task]:
+    """Return tasks in order. Plans only if this is a fresh session or resume
+    finds an empty plan."""
+    if resume:
+        existing = await _load_tasks(session_id)
+        if existing:
+            return existing
+
+    await _set_session_status(session_id, SessionStatus.planning)
+    log.info(Events.SESSION_PLANNING)
+
+    doc_filenames = await _list_session_documents(session_id)
+    doc_note = (
+        f"\n\nUploaded documents available for this session: {', '.join(doc_filenames)}."
+        if doc_filenames
+        else ""
+    )
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "user", "content": f"Research goal:\n\n{goal}{doc_note}"},
+    ]
+
+    try:
+        response = await complete(
+            purpose=LLMPurpose.plan,
+            messages=messages,
+            tools=[_CREATE_PLAN_FUNCTION],
+            tool_choice={"type": "function", "function": {"name": "create_plan"}},
+            temperature=0.3,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        log.exception("plan.failed", error=str(exc))
+        return []
+
+    plan = _parse_plan_response(response)
+    if not plan or not plan.tasks:
+        log.warning("plan.empty")
+        return []
+
+    tasks = await _persist_plan(session_id, plan)
+    log.info(Events.SESSION_PLAN_READY, task_count=len(tasks))
+    await bus.publish(
+        AgentEvent(
+            session_id=session_id,
+            type=EventTypes.PLAN_READY,
+            data={
+                "tasks": [
+                    {
+                        "id": str(t.id),
+                        "order_index": t.order_index,
+                        "description": t.description,
+                        "status": t.status.value,
+                    }
+                    for t in tasks
+                ]
+            },
+        )
+    )
+    return tasks
+
+
+def _parse_plan_response(response) -> Plan | None:
+    if response.type != "tool_calls" or not response.calls:
+        return None
+    call = response.calls[0]
+    if call.name != "create_plan" or not call.decoded:
+        return None
+    try:
+        return Plan.model_validate(call.arguments)
+    except ValidationError:
+        return None
+
+
+async def _persist_plan(session_id: UUID, plan: Plan) -> list[Task]:
+    async with session_scope() as db:
+        rows = [
+            Task(
+                session_id=session_id,
+                order_index=i,
+                description=t.description,
+                status=TaskStatus.pending,
+            )
+            for i, t in enumerate(plan.tasks)
+        ]
+        db.add_all(rows)
+        await db.flush()  # populate ids
+        # Detach by capturing field values; SQLAlchemy will close the session.
+        captured = [
+            Task(
+                id=r.id,
+                session_id=r.session_id,
+                order_index=r.order_index,
+                description=r.description,
+                status=r.status,
+            )
+            for r in rows
+        ]
+    return captured
+
+
+# --- Phase 2: per-task execution -------------------------------------------
+
+
+_EXECUTOR_TOOL_NAMES = [
+    "web_search",
+    "fetch_url",
+    "search_memory",
+    "search_documents",
+    "finish_task",
+]
+
+# Inner-loop scratchpad: when the conversation grows past 3 tool exchanges,
+# older ones are folded into a short text summary stored as a synthetic
+# assistant message at the head of the chain.
+_TOOL_EXCHANGES_VERBATIM = 3
+
+
+@dataclass
+class _ToolExchange:
+    """One model-call → tool-execution pair from the inner loop."""
+
+    assistant_message: dict[str, Any]
+    tool_messages: list[dict[str, Any]]
+
+
+async def _execute_task(
+    *,
+    session_id: UUID,
+    task_id: UUID,
+    goal: str,
+    task_description: str,
+    completed: list[tuple[str, str, list[str]]],
+) -> bool:
+    """Run the inner tool loop for one task. Returns True on success."""
+
+    # Bind the session contextvar so tools (fetch_url, search_*) can resolve it.
+    token = tools_pkg.current_session_id.set(session_id)
+    try:
+        with bind_task(task_id):
+            await _set_task_status(task_id, TaskStatus.in_progress)
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.TASK_STATUS_CHANGED,
+                    data={
+                        "task_id": str(task_id),
+                        "status": TaskStatus.in_progress.value,
+                    },
+                )
+            )
+            log.info(Events.TASK_STARTED, description=task_description)
+
+            try:
+                ok = await _inner_tool_loop(
+                    session_id=session_id,
+                    task_id=task_id,
+                    goal=goal,
+                    task_description=task_description,
+                    completed=completed,
+                )
+            except Exception as exc:
+                log.exception(Events.TASK_FAILED, error=str(exc))
+                await _set_task_status(task_id, TaskStatus.failed)
+                await bus.publish(
+                    AgentEvent(
+                        session_id=session_id,
+                        type=EventTypes.TASK_STATUS_CHANGED,
+                        data={
+                            "task_id": str(task_id),
+                            "status": TaskStatus.failed.value,
+                            "error": str(exc),
+                        },
+                    )
+                )
+                return False
+
+            status = TaskStatus.done if ok else TaskStatus.failed
+            if not ok:
+                await _set_task_status(task_id, status)
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.TASK_STATUS_CHANGED,
+                    data={"task_id": str(task_id), "status": status.value},
+                )
+            )
+            log.info(
+                Events.TASK_COMPLETED if ok else Events.TASK_FAILED,
+                status=status.value,
+            )
+            return ok
+    finally:
+        tools_pkg.current_session_id.reset(token)
+
+
+async def _inner_tool_loop(
+    *,
+    session_id: UUID,
+    task_id: UUID,
+    goal: str,
+    task_description: str,
+    completed: list[tuple[str, str, list[str]]],
+) -> bool:
+    """Drive the tool-call loop until finish_task succeeds or we run out of
+    iterations / corrective attempts. Returns True on a successful finish."""
+
+    # Build the initial system + user context. Completed-task summaries are
+    # truncated to 200 tokens each to keep the prompt focused.
+    completed_block = _format_completed(completed)
+    user_block = (
+        f"OVERALL GOAL:\n{goal}\n\n"
+        f"COMPLETED SO FAR:\n{completed_block or '(none)'}\n\n"
+        f"YOUR CURRENT TASK:\n{task_description}"
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": EXECUTOR_SYSTEM},
+        {"role": "user", "content": user_block},
+    ]
+    tools = tools_pkg.openai_schemas_for(_EXECUTOR_TOOL_NAMES)
+
+    exchanges: list[_ToolExchange] = []
+    correction_attempts = 0
+    max_iters = settings.max_tool_iterations_per_task
+
+    for iteration in range(max_iters):
+        log.info(Events.TASK_TOOL_ITERATION, iteration=iteration)
+
+        ctx = _build_context_window(messages, exchanges)
+        response = await complete(
+            purpose=LLMPurpose.decide,
+            messages=ctx,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            temperature=0.2,
+            session_id=session_id,
+            task_id=task_id,
+        )
+
+        if response.type != "tool_calls" or not response.calls:
+            # Model gave up and emitted text; treat as a soft failure of
+            # the task — no result to persist.
+            log.info("task.no_tool_call", iteration=iteration)
+            return False
+
+        # Assistant message that issued the calls (recorded so the model
+        # sees its own prior turn in subsequent iterations).
+        assistant_msg = _assistant_message_from_calls(response.calls)
+        tool_results = await _execute_parallel_tools(
+            response.calls, session_id=session_id, task_id=task_id
+        )
+
+        # Check for a successful finish_task before recording the exchange:
+        # if successful, we can short-circuit and not extend the conversation.
+        finish_outcome = _check_finish(response.calls, tool_results)
+        if finish_outcome is _FinishOutcome.SUCCESS:
+            payload = next(
+                tr for tc, tr in zip(response.calls, tool_results) if tc.name == "finish_task"
+            )
+            output = payload["output"]
+            await _persist_task_result(
+                task_id,
+                result_summary=output["result_summary"],
+                sources=list(output.get("sources", [])),
+            )
+            return True
+        if finish_outcome is _FinishOutcome.CORRECTION_REQUIRED:
+            correction_attempts += 1
+            if correction_attempts > 2:
+                log.info("task.finish_corrections_exhausted")
+                return False
+
+        exchanges.append(
+            _ToolExchange(
+                assistant_message=assistant_msg, tool_messages=tool_results_to_messages(tool_results)
+            )
+        )
+
+    log.info("task.iterations_exhausted", iterations=max_iters)
+    return False
+
+
+# --- Context-window assembly ----------------------------------------------
+
+
+def _build_context_window(
+    base_messages: list[dict[str, Any]],
+    exchanges: list[_ToolExchange],
+) -> list[dict[str, Any]]:
+    """Stitch base + recent exchanges into a budget-bounded prompt.
+
+    Recent exchanges (last 3) are appended verbatim. Older exchanges are
+    folded into a single synthetic 'scratchpad' assistant message that
+    summarizes what's already been tried. If the result still exceeds the
+    token budget, oldest non-essential items are dropped and we log
+    `context.truncated`.
+    """
+    out = list(base_messages)
+
+    older = exchanges[: max(0, len(exchanges) - _TOOL_EXCHANGES_VERBATIM)]
+    recent = exchanges[-_TOOL_EXCHANGES_VERBATIM:]
+
+    if older:
+        scratch_lines: list[str] = ["Earlier tool activity (summarized):"]
+        for ex in older:
+            for tm in ex.tool_messages:
+                name = tm.get("name", "tool")
+                # Tool messages carry JSON content; collapse to a short hint
+                # to avoid bloating the scratchpad with raw payloads.
+                content = tm.get("content", "")
+                hint = content[:200].replace("\n", " ")
+                scratch_lines.append(f"- {name}: {hint}")
+        out.append({"role": "assistant", "content": "\n".join(scratch_lines)})
+
+    for ex in recent:
+        out.append(ex.assistant_message)
+        out.extend(ex.tool_messages)
+
+    # Budget enforcement: drop the scratchpad first (if present), then drop
+    # oldest recent exchanges one by one.
+    budget = settings.token_budget_per_call
+    while _count_messages(out) > budget and len(out) > 2:
+        # Skip the system + initial user (indices 0, 1); drop the next item.
+        truncated = out.pop(2)
+        log.info(
+            Events.CONTEXT_TRUNCATED,
+            dropped_role=truncated.get("role"),
+            tokens_after=_count_messages(out),
+        )
+
+    return out
+
+
+def _format_completed(
+    completed: list[tuple[str, str, list[str]]],
+) -> str:
+    if not completed:
+        return ""
+    parts: list[str] = []
+    for desc, summary, sources in completed:
+        truncated = _truncate_to_tokens(summary, 200)
+        src_line = f" Sources: {', '.join(sources[:5])}" if sources else ""
+        parts.append(f"- {desc}\n  {truncated}{src_line}")
+    return "\n".join(parts)
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    tokens = _ENCODER.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return _ENCODER.decode(tokens[:max_tokens]) + "…"
+
+
+# --- Tool dispatch helpers -------------------------------------------------
+
+
+class _FinishOutcome:
+    SUCCESS = "success"
+    CORRECTION_REQUIRED = "correction_required"
+    NOT_PRESENT = "not_present"
+
+
+def _check_finish(calls, results) -> str:
+    """Did this turn call finish_task? Was it accepted? Did it need correction?"""
+    for call, result in zip(calls, results):
+        if call.name != "finish_task":
+            continue
+        if result.get("error"):
+            return _FinishOutcome.CORRECTION_REQUIRED
+        return _FinishOutcome.SUCCESS
+    return _FinishOutcome.NOT_PRESENT
+
+
+def _assistant_message_from_calls(calls) -> dict[str, Any]:
+    """Reconstruct the OpenAI assistant message that issued these tool calls."""
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": c.id,
+                "type": "function",
+                "function": {"name": c.name, "arguments": c.raw_arguments or "{}"},
+            }
+            for c in calls
+        ],
+    }
+
+
+async def _execute_parallel_tools(
+    calls, *, session_id: UUID, task_id: UUID
+) -> list[dict[str, Any]]:
+    """Run all requested tool calls concurrently. Returns aligned results in
+    call order. Each result is a dict {tool_call_id, output|error}."""
+
+    async def _one(call):
+        await bus.publish(
+            AgentEvent(
+                session_id=session_id,
+                type=EventTypes.TOOL_INVOKED,
+                data={
+                    "task_id": str(task_id),
+                    "tool": call.name,
+                    "input_preview": _truncate_to_tokens(call.raw_arguments or "", 50),
+                },
+            )
+        )
+        try:
+            if not call.decoded:
+                return {
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "error": (
+                        "Arguments were not valid JSON. Please retry with a "
+                        "valid JSON object."
+                    ),
+                }
+            output_model = await tools_pkg.invoke(call.name, call.arguments)
+            output = output_model.model_dump()
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.TOOL_COMPLETED,
+                    data={"task_id": str(task_id), "tool": call.name},
+                )
+            )
+            return {
+                "tool_call_id": call.id,
+                "name": call.name,
+                "output": output,
+            }
+        except ValidationError as exc:
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.TOOL_FAILED,
+                    data={
+                        "task_id": str(task_id),
+                        "tool": call.name,
+                        "error": "validation",
+                    },
+                )
+            )
+            return {
+                "tool_call_id": call.id,
+                "name": call.name,
+                "error": f"Input validation failed: {exc.errors()}",
+            }
+        except (KeyError, ToolError) as exc:
+            await bus.publish(
+                AgentEvent(
+                    session_id=session_id,
+                    type=EventTypes.TOOL_FAILED,
+                    data={
+                        "task_id": str(task_id),
+                        "tool": call.name,
+                        "error": str(exc),
+                    },
+                )
+            )
+            return {
+                "tool_call_id": call.id,
+                "name": call.name,
+                "error": str(exc),
+            }
+
+    return await asyncio.gather(*(_one(c) for c in calls))
+
+
+def tool_results_to_messages(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Render parallel tool results as a list of `role: tool` messages."""
+    import json as _json
+
+    messages: list[dict[str, Any]] = []
+    for r in results:
+        if "output" in r:
+            content = _json.dumps(r["output"], default=str)
+        else:
+            content = _json.dumps({"error": r.get("error", "tool failed")})
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": r["tool_call_id"],
+                "name": r["name"],
+                "content": content,
+            }
+        )
+    return messages
+
+
+# --- Phase 3: synthesis ----------------------------------------------------
+
+
+async def _synthesize(
+    goal: str,
+    completed: list[tuple[str, str, list[str]]],
+    session_id: UUID,
+) -> str:
+    """Generate a structured markdown report from the completed-task summaries."""
+    if not completed:
+        log.warning("synthesize.no_completed_tasks")
+        return ""
+
+    task_block_parts = []
+    for i, (desc, summary, sources) in enumerate(completed):
+        src_block = "\n".join(f"  - {s}" for s in sources) if sources else "  (no sources)"
+        task_block_parts.append(
+            f"### Task {i + 1}: {desc}\n\n{summary}\n\nSources:\n{src_block}"
+        )
+    task_block = "\n\n".join(task_block_parts)
+
+    messages = [
+        {"role": "system", "content": SYNTHESIZER_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"RESEARCH GOAL:\n{goal}\n\n"
+                f"COMPLETED TASK SUMMARIES:\n\n{task_block}"
+            ),
+        },
+    ]
+
+    try:
+        response = await complete(
+            purpose=LLMPurpose.synthesize,
+            messages=messages,
+            temperature=0.3,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        log.exception("synthesize.failed", error=str(exc))
+        return ""
+
+    if response.type != "text":
+        log.warning("synthesize.unexpected_response_type")
+        return ""
+    return response.content
+
+
+# --- DB helpers ------------------------------------------------------------
+
+
+async def _load_tasks(session_id: UUID) -> list[Task]:
+    async with session_scope() as db:
+        result = await db.execute(
+            select(Task).where(Task.session_id == session_id).order_by(Task.order_index)
+        )
+        rows = result.scalars().all()
+        # Detach.
+        return [
+            Task(
+                id=r.id,
+                session_id=r.session_id,
+                order_index=r.order_index,
+                description=r.description,
+                status=r.status,
+                result_summary=r.result_summary,
+                sources=r.sources,
+            )
+            for r in rows
+        ]
+
+
+async def _list_session_documents(session_id: UUID) -> list[str]:
+    """Returns filenames of documents bound to this session (or globals)."""
+    async with session_scope() as db:
+        result = await db.execute(
+            select(Document.filename).where(
+                (Document.session_id == session_id) | (Document.session_id.is_(None))
+            )
+        )
+        return list(result.scalars().all())
+
+
+async def _set_session_status(session_id: UUID, status: SessionStatus) -> None:
+    async with session_scope() as db:
+        sess = await db.get(Session, session_id)
+        if sess is not None:
+            sess.status = status
+
+
+async def _set_task_status(task_id: UUID, status: TaskStatus) -> None:
+    async with session_scope() as db:
+        t = await db.get(Task, task_id)
+        if t is not None:
+            t.status = status
+
+
+async def _persist_task_result(
+    task_id: UUID, *, result_summary: str, sources: list[str]
+) -> None:
+    async with session_scope() as db:
+        t = await db.get(Task, task_id)
+        if t is not None:
+            t.result_summary = result_summary
+            t.sources = sources
+            t.status = TaskStatus.done
+
+
+__all__ = ["run_session"]
