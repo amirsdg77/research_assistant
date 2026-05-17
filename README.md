@@ -4,7 +4,9 @@ A small AI agent that takes a high-level research goal, decomposes it into a TOD
 
 Users can optionally upload their own documents (PDF, DOCX, TXT, MD) as additional research sources. The agent picks tools intelligently — uploaded documents first, then session memory, then fresh web search.
 
-![architecture](docs/architecture.svg)
+![Research Agent UI — chat column on the left, live TODO panel and activity feed on the right](docs/ui.png)
+
+**Demo video:** [`docs/demo.mp4`](docs/demo.mp4) — 3-minute walkthrough of a real session from goal to verified report.
 
 ```
 goal → planner (gpt-4o, forced fn-call) → 3-7 sub-questions
