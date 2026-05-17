@@ -32,6 +32,9 @@ structlog==24.4.0
 
 # --- CLI ---
 typer==0.13.1
+# typer 0.13.x is incompatible with click 8.2+ (make_metavar signature change).
+# Pin to the last 8.1.x release until typer ships compatibility.
+click==8.1.7
 rich==13.9.4
 
 # --- Tests ---

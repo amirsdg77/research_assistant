@@ -22,7 +22,7 @@ from src import memory as memory_mod
 from src.memory import InMemoryStubStore
 from src.tools import invoke, openai_schemas_for
 from src.tools.base import ToolError
-from src.tools.fetch_url import current_session_id
+from src.tools.base import current_session_id
 from src.tools.finish_task import finish_task_spec
 from src.tools.web_search import WebSearchInput
 
@@ -136,7 +136,7 @@ async def test_fetch_url_end_to_end(monkeypatch):
     monkeypatch.setattr(memory_mod, "store", fresh_store)
 
     async def _fake_get(url):
-        return ("This is the main article body.", "Sample Title")
+        return ("This is the main article body. " * 30, "Sample Title")
 
     monkeypatch.setattr("src.tools.fetch_url._http_get", _fake_get)
 
@@ -175,6 +175,66 @@ async def test_fetch_url_propagates_tool_error(monkeypatch):
             await invoke("fetch_url", {"url": "https://example.com"})
     finally:
         current_session_id.reset(token)
+
+
+# --- fetch_url runtime guards ------------------------------------------
+
+
+async def test_fetch_url_rejects_duplicate_within_task(monkeypatch):
+    """Second fetch of the same URL within one task short-circuits with an
+    actionable ToolError pointing the model at search_memory."""
+    from src.tools.base import fetched_urls
+
+    fresh_store = InMemoryStubStore()
+    monkeypatch.setattr(memory_mod, "store", fresh_store)
+
+    async def _fake_get(url):
+        return ("Body. " * 60, "T")
+
+    monkeypatch.setattr("src.tools.fetch_url._http_get", _fake_get)
+    monkeypatch.setattr(
+        "src.tools.fetch_url._summarize", AsyncMock(return_value="sum")
+    )
+
+    sid = uuid4()
+    s_token = current_session_id.set(sid)
+    u_token = fetched_urls.set(set())
+    try:
+        await invoke("fetch_url", {"url": "https://a/x"})
+        with pytest.raises(ToolError) as exc:
+            await invoke("fetch_url", {"url": "https://a/x"})
+        assert "already fetched" in str(exc.value).lower()
+    finally:
+        current_session_id.reset(s_token)
+        fetched_urls.reset(u_token)
+
+
+async def test_fetch_url_treats_short_text_as_failure(monkeypatch):
+    """Pages that return <200 chars of usable text are flagged as unusable
+    and the URL is recorded so the model doesn't retry it."""
+    from src.tools.base import fetched_urls
+
+    fresh_store = InMemoryStubStore()
+    monkeypatch.setattr(memory_mod, "store", fresh_store)
+
+    async def _fake_get(url):
+        return ("only a tiny bit of text", "T")
+
+    monkeypatch.setattr("src.tools.fetch_url._http_get", _fake_get)
+
+    sid = uuid4()
+    s_token = current_session_id.set(sid)
+    seen: set[str] = set()
+    u_token = fetched_urls.set(seen)
+    try:
+        with pytest.raises(ToolError) as exc:
+            await invoke("fetch_url", {"url": "https://short/x"})
+        assert "chars of usable text" in str(exc.value)
+        # URL was recorded so a retry would be deduped.
+        assert "https://short/x" in seen
+    finally:
+        current_session_id.reset(s_token)
+        fetched_urls.reset(u_token)
 
 
 # --- search_memory hits the store --------------------------------------

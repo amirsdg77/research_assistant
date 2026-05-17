@@ -14,10 +14,23 @@ model verbatim — that's what powers the self-correction loop.
 """
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
+from uuid import UUID
 
 from pydantic import BaseModel
+
+
+current_session_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar(
+    "current_session_id", default=None
+)
+
+# Per-task set of URLs already fetched. Set by the agent at task entry.
+# Tools can check membership to avoid redundant work.
+fetched_urls: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
+    "fetched_urls", default=None
+)
 
 
 class ToolError(Exception):

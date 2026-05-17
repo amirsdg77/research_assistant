@@ -21,6 +21,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 # Enum names are declared once so upgrade/downgrade reference the same objects.
+# `create_type=False` on the column-level references prevents SQLAlchemy from
+# auto-emitting CREATE TYPE when the table is created — we manage the lifecycle
+# explicitly in upgrade()/downgrade() with checkfirst=True.
 SESSION_STATUS = sa.Enum(
     "planning",
     "running",
@@ -46,6 +49,19 @@ LLM_PURPOSE = sa.Enum(
     name="llm_purpose",
 )
 
+SESSION_STATUS_REF = postgresql.ENUM(
+    "planning", "running", "completed", "failed", "paused",
+    name="session_status", create_type=False,
+)
+TASK_STATUS_REF = postgresql.ENUM(
+    "pending", "in_progress", "done", "failed", "skipped",
+    name="task_status", create_type=False,
+)
+LLM_PURPOSE_REF = postgresql.ENUM(
+    "plan", "decide", "summarize", "synthesize", "verify",
+    name="llm_purpose", create_type=False,
+)
+
 
 def upgrade() -> None:
     bind = op.get_bind()
@@ -59,7 +75,7 @@ def upgrade() -> None:
         sa.Column("goal", sa.Text(), nullable=False),
         sa.Column(
             "status",
-            SESSION_STATUS,
+            SESSION_STATUS_REF,
             nullable=False,
             server_default="planning",
         ),
@@ -90,7 +106,7 @@ def upgrade() -> None:
         ),
         sa.Column("order_index", sa.Integer(), nullable=False),
         sa.Column("description", sa.Text(), nullable=False),
-        sa.Column("status", TASK_STATUS, nullable=False, server_default="pending"),
+        sa.Column("status", TASK_STATUS_REF, nullable=False, server_default="pending"),
         sa.Column("result_summary", sa.Text(), nullable=True),
         sa.Column("sources", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column(
@@ -126,7 +142,7 @@ def upgrade() -> None:
             sa.ForeignKey("tasks.id", ondelete="SET NULL"),
             nullable=True,
         ),
-        sa.Column("purpose", LLM_PURPOSE, nullable=False),
+        sa.Column("purpose", LLM_PURPOSE_REF, nullable=False),
         sa.Column("model", sa.String(64), nullable=False),
         sa.Column("input_tokens", sa.Integer(), nullable=True),
         sa.Column("output_tokens", sa.Integer(), nullable=True),

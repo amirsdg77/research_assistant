@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     token_budget_per_call: int = 8000
     max_upload_bytes: int = 10 * 1024 * 1024
     max_docs_per_session: int = 10
+    max_concurrent_sessions: int = 4
 
 
 @lru_cache(maxsize=1)

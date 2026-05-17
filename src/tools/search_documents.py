@@ -9,8 +9,7 @@ from pydantic import BaseModel, Field
 
 from src import memory as memory_mod
 from src.logging_setup import Events, get_logger
-from src.tools.base import ToolError, ToolSpec
-from src.tools.fetch_url import current_session_id
+from src.tools.base import ToolError, ToolSpec, current_session_id
 
 
 log = get_logger(__name__)

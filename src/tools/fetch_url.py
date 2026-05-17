@@ -11,7 +11,6 @@ later via `search_memory`.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 from uuid import UUID
 
 import httpx
@@ -22,7 +21,7 @@ from src import memory as memory_mod
 from src.llm import complete
 from src.logging_setup import Events, get_logger
 from src.models import LLMPurpose
-from src.tools.base import ToolError, ToolSpec
+from src.tools.base import ToolError, ToolSpec, current_session_id, fetched_urls
 
 
 log = get_logger(__name__)
@@ -31,6 +30,10 @@ log = get_logger(__name__)
 _FETCH_TIMEOUT_SEC = 10.0
 _MAX_BODY_CHARS = 60_000  # ~15k tokens — cap before chunking
 _SUMMARY_TOKEN_TARGET = 150
+
+# Below this, treat the fetch as having returned no usable content.
+# The handler reports it as a soft failure so the model moves on.
+_MIN_USEFUL_CHARS = 200
 
 
 class FetchUrlInput(BaseModel):
@@ -119,13 +122,36 @@ def _make_fetch_handler(session_id_var):
                 "fetch_url requires an active session; no session_id is bound."
             )
 
+        seen = fetched_urls.get()
+        if seen is not None and args.url in seen:
+            log.info("fetch_url.deduped", url=args.url)
+            raise ToolError(
+                f"URL already fetched in this task: {args.url}. "
+                f"Use search_memory to retrieve its content, or pick a different URL."
+            )
+
         log.info(Events.TOOL_INVOKED, tool="fetch_url", url=args.url)
         try:
             text, title = await _http_get(args.url)
-            summary = await _summarize(text) if text else ""
+            if len(text) < _MIN_USEFUL_CHARS:
+                if seen is not None:
+                    seen.add(args.url)
+                log.info(
+                    "fetch_url.empty_or_short",
+                    url=args.url,
+                    text_chars=len(text),
+                )
+                raise ToolError(
+                    f"fetched page yielded only {len(text)} chars of usable text "
+                    f"(likely JS-rendered, paywalled, or empty). Skip this URL "
+                    f"and try a different result."
+                )
+            summary = await _summarize(text)
             memory_id = await memory_mod.store.add_page(
                 session_id=sid, url=args.url, title=title, text=text
             )
+            if seen is not None:
+                seen.add(args.url)
         except asyncio.CancelledError:
             raise
         except ToolError:
@@ -150,13 +176,6 @@ def _make_fetch_handler(session_id_var):
 
     return handler
 
-
-# Per-task session id used by handlers that need to know which session
-# they're operating in. The agent loop sets this at task entry and resets
-# it on exit; handlers read it via `.get()`.
-current_session_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar(
-    "current_session_id", default=None
-)
 
 fetch_url_spec = ToolSpec(
     name="fetch_url",

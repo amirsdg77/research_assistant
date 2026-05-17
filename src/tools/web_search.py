@@ -51,6 +51,20 @@ def _get_client() -> AsyncTavilyClient:
     return _client
 
 
+async def shutdown() -> None:
+    global _client
+    if _client is not None:
+        close = getattr(_client, "aclose", None) or getattr(_client, "close", None)
+        if close is not None:
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:  # pragma: no cover
+                pass
+        _client = None
+
+
 async def web_search_handler(args: WebSearchInput) -> WebSearchOutput:
     client = _get_client()
     log.info(Events.TOOL_INVOKED, tool="web_search", query=args.query, k=args.max_results)
