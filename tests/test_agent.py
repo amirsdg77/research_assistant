@@ -583,6 +583,63 @@ async def test_last_iteration_restricts_to_finish_task_only(
         assert c["parallel"] is False
 
 
+async def test_forced_finish_salvages_summary_on_empty_sources(
+    fake_db, passing_guardrail, passing_verifier, llm_script, monkeypatch
+):
+    """On the forced-finish iteration, an empty-sources finish_task must NOT
+    cause the task to fail. The runtime salvages the result_summary and
+    persists it with a synthetic source list. This is the guarantee the
+    README's 'forced-finish produces a clean commit' line depends on."""
+    sid = uuid4()
+    fake_db.seed_session(sid)
+
+    from src.config import settings as _settings
+    monkeypatch.setattr(_settings, "max_tool_iterations_per_task", 2)
+
+    llm_script.append(_plan_response("T1", "T2", "T3"))
+
+    # For each of 3 tasks: iter 0 = web_search (irrelevant), iter 1 (forced,
+    # is_last) = finish_task with empty sources → schema rejects → salvage.
+    for i in range(3):
+        llm_script.append(
+            _tool_calls_response(
+                _tool_call("web_search", {"query": "x", "max_results": 3})
+            )
+        )
+        llm_script.append(
+            _tool_calls_response(
+                _tool_call(
+                    "finish_task",
+                    {
+                        "result_summary": f"Salvaged summary for task {i}.",
+                        "sources": [],
+                    },
+                )
+            )
+        )
+    llm_script.append(LLMTextResponse(content="# Report"))
+
+    # Use the real tool registry so Pydantic ValidationError actually fires
+    # on empty sources.
+    import src.tools as real_tools
+    monkeypatch.setattr("src.agent.tools_pkg.invoke", real_tools.invoke)
+    monkeypatch.setattr(
+        "src.agent.tools_pkg.openai_schemas_for", lambda *_a, **_k: []
+    )
+
+    await run_session("Goal.", sid)
+
+    # All three tasks must end DONE (not failed), with the salvaged prose
+    # persisted and a synthetic source list noting the salvage.
+    for t in fake_db.tasks.values():
+        assert t.status == TaskStatus.done, (
+            f"task {t.order_index} ended {t.status}, expected done (salvaged)"
+        )
+        assert t.result_summary is not None
+        assert "Salvaged summary for task" in t.result_summary
+        assert t.sources and "salvage" in t.sources[0].lower()
+
+
 # --- Resume ----
 
 

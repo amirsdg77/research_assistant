@@ -49,7 +49,7 @@ python -m src.cli run "Survey the trade-offs of long-context attention in LLMs."
 
 **Phase 1 — Planning.** One `gpt-4o` call with a forced `create_plan` function call. JSON Schema enforces `tasks: list[{description, rationale}]` with `minItems: 3, maxItems: 7`. Tasks persist with `status=pending`; the UI's TODO panel populates from a `plan.ready` event.
 
-**Phase 2 — Execution.** For each task, an inner tool loop on `gpt-4o-mini` (max 6 iterations). The model picks tools with `tool_choice="auto"`, parallel tool calls run via `asyncio.gather`, results route back as `tool` messages. The loop exits when `finish_task` is called with non-empty sources. **On the final iteration the runtime forces `tool_choice=finish_task` and removes the other tools** so the model can't search forever.
+**Phase 2 — Execution.** For each task, an inner tool loop on `gpt-4o-mini` (max 6 iterations). The model picks tools with `tool_choice="auto"`, parallel tool calls run via `asyncio.gather`, results route back as `tool` messages. The loop exits when `finish_task` is called with non-empty sources. **On the final iteration the runtime forces `tool_choice=finish_task` and removes the other tools.** If the forced call still produces empty sources, the runtime salvages the model's `result_summary` and commits it with a synthetic source list noting the salvage — the task always reaches `done` on the forced iteration as long as the model produced any prose.
 
 **Phase 3 — Synthesis.** One `gpt-4o` call. Input: goal + structured task summaries with sources. Output: markdown report with inline `[n]` citations and a Limitations section.
 
@@ -57,7 +57,7 @@ python -m src.cli run "Survey the trade-offs of long-context attention in LLMs."
 
 **Resume.** Same `run_session` body with `resume=True`. Reuses an existing plan; skips `done` tasks; restarts `in_progress` tasks; picks up at the first `pending`.
 
-**Citation enforcement.** Three layers: `finish_task.sources` has `min_length=1` (Pydantic) → `minItems: 1` in the JSON Schema → the model is structurally pushed to include sources. Empty calls raise `ValidationError` → returned as a tool message → model self-corrects. After 2 corrections the task fails.
+**Citation enforcement.** Three layers: `finish_task.sources` has `min_length=1` (Pydantic) → `minItems: 1` in the JSON Schema → the model is structurally pushed to include sources. Empty calls raise `ValidationError` → returned as a tool message → model self-corrects. After 2 failed corrections mid-loop the task fails. On the final forced iteration the correction counter is short-circuited: an empty-sources call there triggers a salvage path that preserves the `result_summary` rather than discarding it.
 
 ---
 
@@ -98,16 +98,26 @@ Two layers: automated (unit tests) and scenario-based (system tests).
 - `test_build_context_window_preserves_tool_pairing_under_truncation` — OpenAI 400 from orphan tool messages.
 - `test_fetch_url_rejects_duplicate_within_task` — model loop on same URL.
 - `test_last_iteration_restricts_to_finish_task_only` — iteration cap as advisory.
+- `test_forced_finish_salvages_summary_on_empty_sources` — forced-finish must not discard the model's prose.
 
 **System-level scenarios.** Each isolates one or two pipeline components — prompts, schema enforcement, or tool wiring — and defines success as observable behavior of that component, not just "the report looks good."
 
 | # | Scenario (component isolated) | What "working" means |
 |---|---|---|
 | 1 | **Planner prompt** — give a goal with temporal language: *"What's the current latency floor for WebRTC voicebots?"* | Plan has 3-5 tasks. No task starts with *"Understand…"*, *"Explore…"*, *"Research…"* (planner's counter-pattern list held). Tasks reference the current year (planner saw the injected `Current date:` line). Each task has a non-empty `rationale`. `plan.ready` event fires within ~10s. |
-| 2 | **Executor prompt + citation enforcement + forced-finish** — any researchable goal | Every completed task ends with `finish_task` carrying ≥ 1 source (schema layer enforced). At least one task's `result_summary` contains ≥ 3 numeric facts (executor's density rule). No task hits `iterations_exhausted` — if the model would loop, the runtime's forced `tool_choice=finish_task` on the last iteration produces a clean commit. If the model attempts empty sources, the activity feed shows a `tool.failed` then a retry, and the retry succeeds within 2 attempts. |
+| 2 | **Executor prompt + citation enforcement + forced-finish** — any researchable goal | Every completed task ends with `finish_task` carrying ≥ 1 source (schema layer enforced) or, on the forced final iteration, with a synthetic salvage source if the model produced prose but no sources. At least one task's `result_summary` contains ≥ 3 numeric facts (executor's density rule). Every task reaches `done` — the forced-finish salvage means `task.iterations_exhausted` is unreachable when the model issued any `finish_task` call. If the model attempts empty sources mid-loop, the activity feed shows a `tool.failed` then a retry; after 2 failed corrections mid-loop, the task fails. |
 | 3 | **Synthesizer structural contract** — any completed run | Report contains all required sections: `# Title`, `## Summary`, ≥ 2 body sections, `## Limitations`, `## Sources`. Every inline `[n]` resolves to a numbered Sources entry — no orphans. Body section headings are content-derived (not *"Findings"*, *"Analysis"*, *"Section 1"*). Limitations names ≥ 2 categories from the prompt's list (Data Recency, Coverage Gaps, Source Quality, Unresolved Disagreements, Goal Facets). |
 | 4 | **Verifier prompt calibration** — same run as #3 | Verifier returns 0-5 unsupported claims (within the prompt's calibration band). Each flagged claim is a quoted or paraphrased fragment ≤ 200 chars, not a generic comment like *"section 2 has issues."* If the synthesizer escalated wording (e.g. *"associated with"* → *"causes"*), the verifier catches it. Verification notes surface in the UI; the report still publishes (informational, not blocking). |
 | 5 | **Document RAG + page metadata** — upload one PDF, ask *"Using the uploaded document, identify the author's three main claims and the evidence cited for each."* | At least one task description begins with *"Using the uploaded documents…"* or *"From the uploaded documents…"* (planner's document-grounding rule). The executor invokes `search_documents` (visible in the activity feed). At least one citation in the final report references the uploaded filename. If the PDF had real pages, page numbers appear in the chunk metadata. |
+
+---
+
+## Known limitations
+
+- **Single-worker event bus** (in-process `asyncio.Queue`). With `uvicorn --workers > 1`, SSE clients on worker A can't see events from sessions running on worker B. The bus interface is the contract; swapping in Redis pub/sub is a one-file change.
+- **Resume granularity is per-task.** A task that crashed mid-iteration restarts from iteration 0, not from the failed iteration.
+- **Verifier output is informational.** The flagged claims surface to the user but don't loop back to schedule a "patch this section" task. A natural extension.
+- **No `/cancel` endpoint.** Sessions run to completion, failure, or the per-task iteration cap.
 
 ---
 

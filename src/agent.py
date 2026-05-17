@@ -582,10 +582,28 @@ async def _inner_tool_loop(
             )
             return True
         if finish_outcome is _FinishOutcome.CORRECTION_REQUIRED:
-            correction_attempts += 1
-            if correction_attempts > 2:
-                log.info("task.finish_corrections_exhausted")
-                return False
+            # On the forced-finish iteration, salvage the result_summary the
+            # model produced rather than wasting it. The schema rejected the
+            # call (likely empty sources), but the prose is still useful —
+            # better a published report with a synthetic-source note than a
+            # silently-discarded summary.
+            if is_last:
+                salvaged = _salvage_finish_summary(response.calls)
+                if salvaged is not None:
+                    log.info("task.finish_salvaged_on_forced_finish")
+                    await _persist_task_result(
+                        task_id,
+                        result_summary=salvaged,
+                        sources=["(no sources cited; forced-finish salvage)"],
+                    )
+                    return True
+                # No salvageable prose either — fall through to the
+                # iterations-exhausted return at loop end.
+            else:
+                correction_attempts += 1
+                if correction_attempts > 2:
+                    log.info("task.finish_corrections_exhausted")
+                    return False
 
         exchanges.append(
             _ToolExchange(
@@ -705,6 +723,22 @@ def _check_finish(calls, results) -> _FinishOutcome:
             return _FinishOutcome.CORRECTION_REQUIRED
         return _FinishOutcome.SUCCESS
     return _FinishOutcome.NOT_PRESENT
+
+
+def _salvage_finish_summary(calls) -> str | None:
+    """Extract a usable result_summary from a rejected finish_task call.
+
+    Used only on the forced-finish iteration when the schema rejected the
+    model's call (empty sources, etc.). Returns the prose if present and
+    non-trivial; None if there's nothing worth saving.
+    """
+    for call in calls:
+        if call.name != "finish_task":
+            continue
+        summary = (call.arguments or {}).get("result_summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+    return None
 
 
 def _assistant_message_from_calls(calls) -> dict[str, Any]:
