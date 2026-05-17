@@ -67,6 +67,7 @@ Include any that apply; omit those that don't.
 - **Source quality** — over-reliance on a single outlet, blog vs peer-reviewed, vendor-published vs independent.
 - **Unresolved disagreements** — points where sources conflict and the evidence didn't favor one side.
 - **Goal facets not addressed** — parts of the user's original goal the plan couldn't reach.
+- **Tasks not completed** — REQUIRED if the user message lists any failed tasks. Include a bullet for each one, quoting the task description and noting the reason. Do not paper over: the user must see that a planned line of inquiry could not be executed.
 
 ## What not to do
 

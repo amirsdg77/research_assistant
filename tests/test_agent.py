@@ -729,6 +729,71 @@ async def test_resume_restarts_in_progress_tasks(
     assert refreshed.result_summary is not None
 
 
+# --- Failed-task surfacing ----
+
+
+async def test_failed_tasks_are_surfaced_to_synthesizer(
+    fake_db, passing_guardrail, passing_verifier, tool_invoker, llm_script, monkeypatch
+):
+    """When a task fails, its description must reach the synthesizer in the
+    user message so the report's Limitations section can name it. The bug
+    this regression-guards: silently dropping failed tasks from synthesis
+    input, producing a confident-looking report that omits a third of the
+    planned research."""
+    sid = uuid4()
+    fake_db.seed_session(sid)
+
+    # Plan with 3 tasks. We arrange task 2 to fail by emitting text instead
+    # of a tool call (the agent treats that as task.no_tool_call → False).
+    llm_script.append(_plan_response("T1", "T2 that will fail", "T3"))
+
+    # Task 1: clean finish.
+    llm_script.append(
+        _tool_calls_response(
+            _tool_call("finish_task", {"result_summary": "T1 done", "sources": ["https://a"]})
+        )
+    )
+    # Task 2: model emits text → no tool call → task fails.
+    llm_script.append(LLMTextResponse(content="I cannot complete this task."))
+    # Task 3: clean finish.
+    llm_script.append(
+        _tool_calls_response(
+            _tool_call("finish_task", {"result_summary": "T3 done", "sources": ["https://c"]})
+        )
+    )
+    # Synthesis: capture the user message that gets sent.
+    llm_script.append(LLMTextResponse(content="# Report\n\nBody."))
+
+    tool_invoker.returns["finish_task"] = {
+        "accepted": True, "result_summary": "ok", "sources": ["https://x"],
+    }
+
+    # Spy on the synthesizer call to inspect its user message.
+    captured_synth_message: dict = {}
+    original_complete = agent_mod.complete
+
+    async def _spy(**kwargs):
+        if kwargs.get("purpose").value == "synthesize":
+            captured_synth_message["content"] = kwargs["messages"][-1]["content"]
+        return await original_complete(**kwargs)
+
+    monkeypatch.setattr(agent_mod, "complete", _spy)
+
+    await run_session("Goal.", sid)
+
+    # The failed task's description must appear in the synthesizer's input.
+    synth_input = captured_synth_message.get("content", "")
+    assert "FAILED TASKS" in synth_input, (
+        f"failed-tasks block missing from synthesizer input:\n{synth_input}"
+    )
+    assert "T2 that will fail" in synth_input, (
+        f"failed task description not propagated:\n{synth_input}"
+    )
+    # The Postgres row for task 2 must be marked failed (not silently dropped).
+    t2 = next(t for t in fake_db.tasks.values() if t.order_index == 1)
+    assert t2.status == TaskStatus.failed
+
+
 # --- Verification notes ----
 
 

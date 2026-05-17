@@ -176,6 +176,7 @@ async def _run_session_inner(
     # --- Phase 2: execution
     await _set_session_status(session_id, SessionStatus.running)
     completed_summaries: list[tuple[str, str, list[str]]] = []  # (description, summary, sources)
+    failed_tasks: list[tuple[str, str]] = []  # (description, failure reason)
 
     for task_row in plan_tasks:
         # Preload already-completed task summaries so resume picks up cleanly.
@@ -187,6 +188,11 @@ async def _run_session_inner(
                     list(task_row.sources or []),
                 )
             )
+            continue
+
+        # Resume: a previously-failed task stays failed; surface to synthesis.
+        if task_row.status == TaskStatus.failed:
+            failed_tasks.append((task_row.description, "previously failed"))
             continue
 
         # Resume: restart anything that was in_progress.
@@ -212,9 +218,13 @@ async def _run_session_inner(
                             list(refreshed.sources or []),
                         )
                     )
+        else:
+            # Task failed — synthesis must know so the Limitations section
+            # can name it explicitly rather than silently dropping coverage.
+            failed_tasks.append((task_row.description, "execution failed"))
 
     # --- Phase 3: synthesis
-    report = await _synthesize(goal, completed_summaries, session_id)
+    report = await _synthesize(goal, completed_summaries, failed_tasks, session_id)
     if not report:
         await _set_session_status(session_id, SessionStatus.failed)
         await bus.publish(
@@ -864,6 +874,7 @@ def tool_results_to_messages(results: list[dict[str, Any]]) -> list[dict[str, An
 async def _synthesize(
     goal: str,
     completed: list[tuple[str, str, list[str]]],
+    failed: list[tuple[str, str]],
     session_id: UUID,
 ) -> str:
     """Generate a structured markdown report from the completed-task summaries."""
@@ -879,6 +890,17 @@ async def _synthesize(
         )
     task_block = "\n\n".join(task_block_parts)
 
+    failed_block = ""
+    if failed:
+        failed_lines = "\n".join(
+            f"- {desc} (reason: {reason})" for desc, reason in failed
+        )
+        failed_block = (
+            f"\n\nFAILED TASKS (not in the summaries above; must be acknowledged "
+            f"in the Limitations section under a 'Tasks not completed' bullet):\n"
+            f"{failed_lines}"
+        )
+
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     messages = [
         {"role": "system", "content": SYNTHESIZER_SYSTEM},
@@ -888,6 +910,7 @@ async def _synthesize(
                 f"Current date: {today}.\n\n"
                 f"RESEARCH GOAL:\n{goal}\n\n"
                 f"COMPLETED TASK SUMMARIES:\n\n{task_block}"
+                f"{failed_block}"
             ),
         },
     ]
