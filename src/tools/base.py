@@ -26,6 +26,12 @@ current_session_id: contextvars.ContextVar[UUID | None] = contextvars.ContextVar
     "current_session_id", default=None
 )
 
+# Per-task set of URLs already fetched. Set by the agent at task entry.
+# Tools can check membership to avoid redundant work.
+fetched_urls: contextvars.ContextVar[set[str] | None] = contextvars.ContextVar(
+    "fetched_urls", default=None
+)
+
 
 class ToolError(Exception):
     """Raised by a handler to signal an operational error (network down,

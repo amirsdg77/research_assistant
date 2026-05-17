@@ -1,6 +1,5 @@
-// Research Agent SPA. Vanilla JS, no build step.
-// Subscribes to SSE, dispatches by event.type, renders the TODO panel +
-// activity feed + final report.
+// Research Agent SPA. Vanilla JS, chat-style layout.
+// Left column = conversational chat log. Right column = TODO + activity panels.
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,28 +11,25 @@ const els = {
   chips: $("file-chips"),
   status: $("status-strip"),
   badge: $("session-badge"),
+  chatLog: $("chat-log"),
+  emptyChat: $("empty-chat"),
   taskList: $("task-list"),
   count: $("todo-count"),
   completeBadge: $("complete-badge"),
   feed: $("activity-feed"),
   pause: $("pause-scroll"),
-  reportSection: $("report-section"),
-  reportBody: $("report-body"),
-  verificationBlock: $("verification-block"),
-  verificationBody: $("verification-body"),
 };
-
-// --- session state -------------------------------------------------------
 
 const state = {
   sessionId: null,
   evtSource: null,
-  tasks: new Map(),       // task_id -> { id, order_index, description, status, ... }
+  tasks: new Map(),
   pendingFiles: [],
   autoScroll: true,
+  statusBubble: null,   // the current "thinking" bubble (gets replaced by report)
 };
 
-// --- file attachment -----------------------------------------------------
+// --- composer behavior -------------------------------------------------
 
 els.fileBtn.addEventListener("click", () => els.fileInput.click());
 els.fileInput.addEventListener("change", (e) => {
@@ -60,15 +56,34 @@ function renderChips() {
   });
 }
 
-// --- run button ----------------------------------------------------------
+// Send on click; also on Ctrl/Cmd + Enter.
+els.run.addEventListener("click", send);
+els.goal.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    send();
+  }
+});
 
-els.run.addEventListener("click", async () => {
+// Auto-resize textarea
+els.goal.addEventListener("input", () => {
+  els.goal.style.height = "auto";
+  els.goal.style.height = Math.min(els.goal.scrollHeight, 160) + "px";
+});
+
+// --- send action -------------------------------------------------------
+
+async function send() {
   const goal = els.goal.value.trim();
   if (!goal) {
     setStatus("Please enter a goal.", "warn");
     return;
   }
-  resetUiForNewSession();
+
+  resetForNewSession();
+  pushUserMessage(goal, state.pendingFiles.map((f) => f.name));
+  state.statusBubble = pushStatusBubble("Creating session");
+
   setRunning(true);
   setStatus("Creating session…");
 
@@ -80,6 +95,7 @@ els.run.addEventListener("click", async () => {
   try {
     resp = await fetch("/api/sessions", { method: "POST", body: fd });
   } catch (e) {
+    failStatusBubble(`Network error: ${e.message}`);
     setStatus(`Network error: ${e.message}`, "error");
     setRunning(false);
     return;
@@ -87,30 +103,39 @@ els.run.addEventListener("click", async () => {
 
   if (!resp.ok) {
     const detail = await resp.text();
-    setStatus(`Failed to create session: ${detail}`, "error");
+    failStatusBubble(`Failed: ${detail}`);
+    setStatus(`Failed to create session.`, "error");
     setRunning(false);
     return;
   }
+
   const body = await resp.json();
   state.sessionId = body.session_id;
   els.badge.hidden = false;
   els.badge.textContent = `session ${body.session_id.slice(0, 8)}`;
+
   if (body.documents?.length) {
     appendFeed("status", "ingested", `${body.documents.length} doc(s) ingested`);
   }
-  setStatus("Subscribing to events…");
-  subscribe(body.session_id);
-});
 
-// --- SSE subscription ----------------------------------------------------
+  // Clear pending files after successful upload.
+  state.pendingFiles = [];
+  renderChips();
+  els.goal.value = "";
+  els.goal.style.height = "auto";
+
+  updateStatusBubble("Planning");
+  setStatus("Planning…");
+  subscribe(body.session_id);
+}
+
+// --- SSE subscription --------------------------------------------------
 
 function subscribe(sessionId) {
   if (state.evtSource) state.evtSource.close();
   const es = new EventSource(`/api/sessions/${sessionId}/events`);
   state.evtSource = es;
 
-  // We listen on specific event names rather than the default 'message' so
-  // the server's `event: <type>` line routes here directly.
   const types = [
     "session.started", "plan.ready", "task.status_changed",
     "tool.invoked", "tool.completed", "tool.failed",
@@ -132,22 +157,23 @@ function subscribe(sessionId) {
   };
 }
 
-// --- event dispatch ------------------------------------------------------
+// --- event dispatch ----------------------------------------------------
 
 function dispatch(type, event) {
   const data = event.data || {};
   switch (type) {
     case "session.started":
-      setStatus("Planning…");
       appendFeed("status", "session", "started");
       break;
     case "plan.ready":
       renderPlan(data.tasks || []);
+      updateStatusBubble(`Planning complete — ${data.tasks?.length || 0} tasks`);
       setStatus(`Plan ready — ${data.tasks?.length || 0} tasks.`);
       break;
     case "task.status_changed":
       updateTaskStatus(data.task_id, data.status, data.error);
       setStatus(progressText());
+      updateStatusBubble(progressText());
       break;
     case "tool.invoked":
       appendFeed("tool", data.tool, `→ ${truncate(data.input_preview, 80)}`);
@@ -162,6 +188,7 @@ function dispatch(type, event) {
       appendTaskToolLine(data.task_id, data.tool, "retrying", "warn");
       break;
     case "report.ready":
+      removeStatusBubble();
       renderReport(data.report || "");
       setStatus("Report ready. Verifying…");
       break;
@@ -174,6 +201,8 @@ function dispatch(type, event) {
       setRunning(false);
       break;
     case "session.failed":
+      removeStatusBubble();
+      pushAgentError(data.error || "session failed");
       setStatus(`Failed: ${data.error || "unknown error"}`, "error");
       setRunning(false);
       break;
@@ -183,7 +212,106 @@ function dispatch(type, event) {
   }
 }
 
-// --- TODO panel rendering ------------------------------------------------
+// --- chat messages -----------------------------------------------------
+
+function pushUserMessage(text, filenames) {
+  hideEmptyChat();
+  const div = document.createElement("div");
+  div.className = "msg user";
+  let html = escapeHtml(text);
+  if (filenames && filenames.length) {
+    html += `<div style="margin-top:6px;font-size:12px;opacity:0.85;">📎 ${filenames.map(escapeHtml).join(", ")}</div>`;
+  }
+  div.innerHTML = html;
+  els.chatLog.appendChild(div);
+  scrollChatToBottom();
+}
+
+function pushStatusBubble(text) {
+  hideEmptyChat();
+  const div = document.createElement("div");
+  div.className = "msg agent status";
+  div.innerHTML = `<span class="status-text">${escapeHtml(text)}</span>` +
+                  `<span class="typing"><span></span><span></span><span></span></span>`;
+  els.chatLog.appendChild(div);
+  scrollChatToBottom();
+  return div;
+}
+
+function updateStatusBubble(text) {
+  if (!state.statusBubble) {
+    state.statusBubble = pushStatusBubble(text);
+    return;
+  }
+  const span = state.statusBubble.querySelector(".status-text");
+  if (span) span.textContent = text;
+}
+
+function failStatusBubble(text) {
+  if (state.statusBubble) {
+    state.statusBubble.classList.remove("status");
+    state.statusBubble.classList.add("error");
+    state.statusBubble.innerHTML = escapeHtml(text);
+    state.statusBubble = null;
+  } else {
+    pushAgentError(text);
+  }
+}
+
+function removeStatusBubble() {
+  if (state.statusBubble && state.statusBubble.parentElement) {
+    state.statusBubble.parentElement.removeChild(state.statusBubble);
+  }
+  state.statusBubble = null;
+}
+
+function pushAgentError(text) {
+  hideEmptyChat();
+  const div = document.createElement("div");
+  div.className = "msg agent error";
+  div.textContent = text;
+  els.chatLog.appendChild(div);
+  scrollChatToBottom();
+}
+
+function hideEmptyChat() {
+  if (els.emptyChat) els.emptyChat.style.display = "none";
+}
+
+function scrollChatToBottom() {
+  // Defer so the new node is laid out before we scroll.
+  requestAnimationFrame(() => {
+    els.chatLog.scrollTop = els.chatLog.scrollHeight;
+  });
+}
+
+// --- report + verification ---------------------------------------------
+
+function renderReport(markdown) {
+  const div = document.createElement("div");
+  div.className = "msg agent report";
+  div.innerHTML = marked.parse(markdown);
+  els.chatLog.appendChild(div);
+  scrollChatToBottom();
+}
+
+function renderVerification(claims, notes) {
+  if (!claims.length && !notes) return;
+  const block = document.createElement("details");
+  block.className = "verification-bubble";
+  let inner = `<summary>⚠ Verification notes</summary>`;
+  if (notes) inner += `<p>${escapeHtml(notes)}</p>`;
+  if (claims.length) {
+    inner += "<ul>";
+    for (const c of claims) inner += `<li>${escapeHtml(c)}</li>`;
+    inner += "</ul>";
+  }
+  block.innerHTML = inner;
+  els.chatLog.appendChild(block);
+  scrollChatToBottom();
+}
+
+// --- TODO panel --------------------------------------------------------
 
 function renderPlan(tasks) {
   state.tasks.clear();
@@ -191,7 +319,7 @@ function renderPlan(tasks) {
   els.count.textContent = tasks.length;
   els.completeBadge.hidden = true;
   for (const t of tasks) {
-    state.tasks.set(t.id, { ...t, tool_lines: [], sources: [], result_summary: null });
+    state.tasks.set(t.id, { ...t });
     els.taskList.appendChild(makeTaskRow(t));
   }
 }
@@ -208,10 +336,6 @@ function makeTaskRow(t) {
     <div class="task-drawer">
       <div class="drawer-section">Tool activity</div>
       <div class="tool-lines"></div>
-      <div class="drawer-section summary-section" hidden>Result</div>
-      <div class="result-summary"></div>
-      <div class="drawer-section sources-section" hidden>Sources</div>
-      <div class="sources"></div>
     </div>`;
   li.querySelector(".task-row-head").addEventListener("click", () =>
     li.classList.toggle("expanded")
@@ -230,7 +354,6 @@ function updateTaskStatus(taskId, status, error) {
   const icon = row.querySelector(".task-icon");
   icon.className = `task-icon ${status}`;
 
-  // Auto-highlight the in_progress task; clear when it advances.
   document.querySelectorAll(".task-row.active").forEach((r) => r.classList.remove("active"));
   if (status === "in_progress") row.classList.add("active");
 
@@ -254,7 +377,7 @@ function appendTagged(container, cls, tool, label) {
   container.appendChild(div);
 }
 
-// --- activity feed -------------------------------------------------------
+// --- activity feed -----------------------------------------------------
 
 els.pause.addEventListener("change", () => {
   state.autoScroll = !els.pause.checked;
@@ -269,32 +392,7 @@ function appendFeed(kind, tag, msg) {
   if (state.autoScroll) els.feed.scrollTop = els.feed.scrollHeight;
 }
 
-// --- report rendering ----------------------------------------------------
-
-function renderReport(markdown) {
-  els.reportSection.hidden = false;
-  // marked v12+ doesn't auto-sanitize; we trust the synthesizer's output
-  // since it's our own LLM. The model is constrained to a citation format
-  // (numbered [n] references) so risk of arbitrary HTML is low.
-  els.reportBody.innerHTML = marked.parse(markdown);
-}
-
-function renderVerification(claims, notes) {
-  if (!claims.length && !notes) {
-    els.verificationBlock.hidden = true;
-    return;
-  }
-  els.verificationBlock.hidden = false;
-  let html = notes ? `<p>${escapeHtml(notes)}</p>` : "";
-  if (claims.length) {
-    html += "<ul>";
-    for (const c of claims) html += `<li>${escapeHtml(c)}</li>`;
-    html += "</ul>";
-  }
-  els.verificationBody.innerHTML = html;
-}
-
-// --- helpers -------------------------------------------------------------
+// --- helpers -----------------------------------------------------------
 
 function setStatus(text, kind) {
   els.status.textContent = text;
@@ -305,34 +403,33 @@ function setStatus(text, kind) {
 
 function setRunning(running) {
   els.run.disabled = running;
-  els.goal.disabled = running;
   els.fileBtn.disabled = running;
 }
 
 function progressText() {
   const total = state.tasks.size;
-  if (!total) return "";
+  if (!total) return "Planning…";
   let done = 0, current = null;
   for (const t of state.tasks.values()) {
     if (t.status === "done") done += 1;
     if (t.status === "in_progress") current = t;
   }
   if (current) {
-    return `Running task ${current.order_index + 1} of ${total}: ${current.description.slice(0, 70)}…`;
+    return `Task ${current.order_index + 1}/${total}: ${current.description.slice(0, 60)}…`;
   }
-  return `${done} of ${total} tasks complete.`;
+  if (done === total) return "Synthesizing report…";
+  return `${done}/${total} tasks complete`;
 }
 
-function resetUiForNewSession() {
+function resetForNewSession() {
   state.tasks.clear();
+  state.statusBubble = null;
+  els.chatLog.innerHTML = "";
+  els.emptyChat = null;  // gone for the rest of this session
   els.taskList.innerHTML = '<li class="empty-state">Planning…</li>';
   els.count.textContent = "0";
   els.completeBadge.hidden = true;
   els.feed.innerHTML = "";
-  els.reportSection.hidden = true;
-  els.reportBody.innerHTML = "";
-  els.verificationBlock.hidden = true;
-  els.verificationBody.innerHTML = "";
   els.badge.hidden = true;
   if (state.evtSource) state.evtSource.close();
   state.evtSource = null;

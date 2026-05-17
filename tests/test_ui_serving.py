@@ -29,11 +29,12 @@ def test_index_html_references_expected_endpoints():
     # Critical wiring the SPA depends on.
     assert "/static/styles.css" in html
     assert "/static/app.js" in html
-    # Composer, todo panel, activity, report — sanity checks on layout ids.
+    # Layout ids the chat UI uses. Report and verification render as inline
+    # chat messages now — no static container element required.
     for elem_id in [
         "goal-input", "run-button", "file-input", "file-chips",
         "task-list", "todo-count", "activity-feed",
-        "report-body", "verification-block",
+        "chat-log",
     ]:
         assert f'id="{elem_id}"' in html, f"missing element id: {elem_id}"
 
@@ -73,7 +74,7 @@ async def test_root_serves_index_html():
         resp = await c.get("/")
     assert resp.status_code == 200
     assert "<html" in resp.text.lower()
-    assert "research-agent" in resp.text
+    assert "research agent" in resp.text.lower()
 
 
 async def test_static_assets_served():

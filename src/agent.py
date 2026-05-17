@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -290,9 +291,16 @@ async def _plan_or_load(
         if doc_filenames
         else ""
     )
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     messages = [
         {"role": "system", "content": PLANNER_SYSTEM},
-        {"role": "user", "content": f"Research goal:\n\n{goal}{doc_note}"},
+        {
+            "role": "user",
+            "content": (
+                f"Current date: {today}.\n\n"
+                f"Research goal:\n\n{goal}{doc_note}"
+            ),
+        },
     ]
 
     try:
@@ -399,7 +407,10 @@ async def _execute_task(
     """Run the inner tool loop for one task. Returns True on success."""
 
     # Bind the session contextvar so tools (fetch_url, search_*) can resolve it.
+    # Also give fetch_url a fresh per-task set of seen URLs so it can dedup.
+    from src.tools.base import fetched_urls as _fetched_urls_var
     token = tools_pkg.current_session_id.set(session_id)
+    urls_token = _fetched_urls_var.set(set())
     try:
         with bind_task(task_id):
             await _set_task_status(task_id, TaskStatus.in_progress)
@@ -456,6 +467,7 @@ async def _execute_task(
             return ok
     finally:
         tools_pkg.current_session_id.reset(token)
+        _fetched_urls_var.reset(urls_token)
 
 
 async def _inner_tool_loop(
@@ -472,7 +484,9 @@ async def _inner_tool_loop(
     # Build the initial system + user context. Completed-task summaries are
     # truncated to 200 tokens each to keep the prompt focused.
     completed_block = _format_completed(completed)
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     user_block = (
+        f"Current date: {today}.\n\n"
         f"OVERALL GOAL:\n{goal}\n\n"
         f"COMPLETED SO FAR:\n{completed_block or '(none)'}\n\n"
         f"YOUR CURRENT TASK:\n{task_description}"
@@ -482,7 +496,8 @@ async def _inner_tool_loop(
         {"role": "system", "content": EXECUTOR_SYSTEM},
         {"role": "user", "content": user_block},
     ]
-    tools = tools_pkg.openai_schemas_for(_EXECUTOR_TOOL_NAMES)
+    all_tools = tools_pkg.openai_schemas_for(_EXECUTOR_TOOL_NAMES)
+    finish_only_tools = tools_pkg.openai_schemas_for(["finish_task"])
 
     exchanges: list[_ToolExchange] = []
     scratch_lines: list[str] = []
@@ -492,13 +507,48 @@ async def _inner_tool_loop(
     for iteration in range(max_iters):
         log.info(Events.TASK_TOOL_ITERATION, iteration=iteration)
 
+        # Budget-aware tool selection:
+        # - Last iteration: only finish_task is offered, and forced. Model
+        #   commits with whatever evidence it has.
+        # - Second-to-last: all tools, but a hint reminds the model this is
+        #   its last chance to gather before forced commit.
+        is_last = iteration == max_iters - 1
+        is_penultimate = iteration == max_iters - 2
+
+        if is_last:
+            tools = finish_only_tools
+            tool_choice: str | dict = {
+                "type": "function",
+                "function": {"name": "finish_task"},
+            }
+        else:
+            tools = all_tools
+            tool_choice = "auto"
+
+        budget_hint = ""
+        if is_penultimate:
+            budget_hint = (
+                "\n\n[Budget notice] You have one iteration left after this one. "
+                "Use this turn to gather final evidence; the next turn will be "
+                "restricted to finish_task only."
+            )
+        elif is_last:
+            budget_hint = (
+                "\n\n[Budget notice] This is your final iteration. Call finish_task "
+                "with the best summary you can produce from the evidence you've "
+                "already gathered. Cite the sources you actually saw."
+            )
+
         ctx = _build_context_window(messages, exchanges, scratch_lines)
+        if budget_hint:
+            ctx = ctx + [{"role": "user", "content": budget_hint.strip()}]
+
         response = await complete(
             purpose=LLMPurpose.decide,
             messages=ctx,
             tools=tools,
-            tool_choice="auto",
-            parallel_tool_calls=True,
+            tool_choice=tool_choice,
+            parallel_tool_calls=not is_last,
             temperature=0.2,
             session_id=session_id,
             task_id=task_id,
@@ -567,36 +617,51 @@ def _build_context_window(
     Recent exchanges (capped at _TOOL_EXCHANGES_VERBATIM) are appended verbatim.
     `scratch_lines` (built incrementally as exchanges age out) becomes a single
     synthetic 'scratchpad' assistant message. If the result still exceeds the
-    token budget, oldest non-essential items are dropped and we log
-    `context.truncated`.
+    token budget we drop oldest items, but always as full assistant+tool-message
+    units so the OpenAI API's tool-pairing requirement is preserved.
     """
     out = list(base_messages)
-    counts = [_count_message_tokens(m) for m in out]
+    scratch_msg: dict[str, Any] | None = None
 
     if scratch_lines:
-        scratch = {
+        scratch_msg = {
             "role": "assistant",
             "content": "Earlier tool activity (summarized):\n" + "\n".join(scratch_lines),
         }
-        out.append(scratch)
-        counts.append(_count_message_tokens(scratch))
+        out.append(scratch_msg)
 
-    for ex in exchanges:
+    working_exchanges = list(exchanges)
+    for ex in working_exchanges:
         out.append(ex.assistant_message)
-        counts.append(_count_message_tokens(ex.assistant_message))
-        for tm in ex.tool_messages:
-            out.append(tm)
-            counts.append(_count_message_tokens(tm))
+        out.extend(ex.tool_messages)
 
-    total = sum(counts)
     budget = settings.token_budget_per_call
-    while total > budget and len(out) > 2:
-        truncated = out.pop(2)
-        total -= counts.pop(2)
+
+    def _total() -> int:
+        return sum(_count_message_tokens(m) for m in out)
+
+    # Drop in priority order: scratchpad first (no tool pairing to worry about),
+    # then whole exchanges from the oldest.
+    while _total() > budget and scratch_msg is not None and scratch_msg in out:
+        out.remove(scratch_msg)
         log.info(
             Events.CONTEXT_TRUNCATED,
-            dropped_role=truncated.get("role"),
-            tokens_after=total,
+            dropped="scratchpad",
+            tokens_after=_total(),
+        )
+        scratch_msg = None
+
+    while _total() > budget and working_exchanges:
+        oldest = working_exchanges.pop(0)
+        out.remove(oldest.assistant_message)
+        for tm in oldest.tool_messages:
+            if tm in out:
+                out.remove(tm)
+        log.info(
+            Events.CONTEXT_TRUNCATED,
+            dropped="exchange",
+            tool_msgs=len(oldest.tool_messages),
+            tokens_after=_total(),
         )
 
     return out
@@ -780,11 +845,13 @@ async def _synthesize(
         )
     task_block = "\n\n".join(task_block_parts)
 
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
     messages = [
         {"role": "system", "content": SYNTHESIZER_SYSTEM},
         {
             "role": "user",
             "content": (
+                f"Current date: {today}.\n\n"
                 f"RESEARCH GOAL:\n{goal}\n\n"
                 f"COMPLETED TASK SUMMARIES:\n\n{task_block}"
             ),

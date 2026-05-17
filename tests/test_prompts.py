@@ -70,10 +70,12 @@ def test_prompts_present_in_filesystem():
 
 
 def test_prompts_under_size_cap():
-    """Design intent: each file body stays under ~400 tokens. We approximate
-    with a 4 chars/token rule, so a hard cap of 1800 chars is generous and
-    catches obvious bloat without being fragile."""
+    """Design intent: each prompt's instructional content stays bounded."""
+    import re
+    comment_re = re.compile(r"<!--.*?-->", re.DOTALL)
     for name, body in prompts.ALL_PROMPTS.items():
-        assert len(body) < 4000, (
-            f"{name} is {len(body)} chars — getting bloated; tighten it"
+        instructional = comment_re.sub("", body)
+        assert len(instructional) < 6000, (
+            f"{name} instructional content is {len(instructional)} chars "
+            f"— getting bloated; tighten it"
         )

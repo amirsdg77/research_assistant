@@ -519,6 +519,70 @@ async def test_iteration_cap_fails_task(
     assert all(t.status == TaskStatus.failed for t in fake_db.tasks.values())
 
 
+async def test_last_iteration_restricts_to_finish_task_only(
+    fake_db, passing_guardrail, passing_verifier, tool_invoker, llm_script, monkeypatch
+):
+    """On the final iteration, complete() should be called with only
+    finish_task in tools and tool_choice forced to finish_task. The model
+    can't keep searching past the cap."""
+    sid = uuid4()
+    fake_db.seed_session(sid)
+
+    from src.config import settings as _settings
+    monkeypatch.setattr(_settings, "max_tool_iterations_per_task", 2)
+
+    captured: list[dict] = []
+
+    original_complete = __import__("src.agent", fromlist=["complete"]).complete
+
+    async def _spy(**kwargs):
+        if kwargs.get("purpose").value == "decide":
+            captured.append({
+                "tool_count": len(kwargs.get("tools") or []),
+                "tool_choice": kwargs.get("tool_choice"),
+                "parallel": kwargs.get("parallel_tool_calls"),
+            })
+        return await original_complete(**kwargs)
+
+    monkeypatch.setattr("src.agent.complete", _spy)
+
+    llm_script.append(_plan_response("T1", "T2", "T3"))
+    # Three tasks × 2 iters: iter 0 does web_search, iter 1 (forced) does finish_task.
+    for _ in range(3):
+        llm_script.append(_tool_calls_response(
+            _tool_call("web_search", {"query": "x", "max_results": 3})
+        ))
+        llm_script.append(_tool_calls_response(
+            _tool_call("finish_task", {
+                "result_summary": "ok", "sources": ["https://x"]
+            })
+        ))
+    llm_script.append(LLMTextResponse(content="# Report"))
+
+    tool_invoker.returns["web_search"] = {"query": "x", "results": []}
+    tool_invoker.returns["finish_task"] = {
+        "accepted": True, "result_summary": "ok", "sources": ["https://x"]
+    }
+
+    await run_session("Goal.", sid)
+
+    # Across 6 decide calls (3 tasks × 2 iters), every even-indexed one
+    # (iter 0) should have 5 tools + auto choice, every odd one (iter 1, the
+    # last) should have 1 tool + forced finish_task.
+    iter0_calls = captured[0::2]
+    iter1_calls = captured[1::2]
+    for c in iter0_calls:
+        assert c["tool_choice"] == "auto"
+        assert c["parallel"] is True
+    for c in iter1_calls:
+        assert isinstance(c["tool_choice"], dict)
+        assert c["tool_choice"]["function"]["name"] == "finish_task"
+        # Parallel tool calls must be off on the last forced iteration —
+        # otherwise the model could try to emit a finish_task alongside more
+        # searches.
+        assert c["parallel"] is False
+
+
 # --- Resume ----
 
 
@@ -686,3 +750,91 @@ async def test_session_completed_event_fires(
     assert EventTypes.SESSION_STARTED in seen_types
     assert EventTypes.PLAN_READY in seen_types
     assert EventTypes.SESSION_COMPLETED in seen_types
+
+
+# --- Context-window assembly ---
+
+
+def test_build_context_window_preserves_tool_pairing_under_truncation(monkeypatch):
+    """Regression: OpenAI rejects messages where a 'tool' role appears without
+    a preceding assistant message carrying matching tool_calls. The truncator
+    must drop whole exchanges atomically, never an assistant alone."""
+    from src.agent import _ToolExchange, _build_context_window
+
+    # Tiny token budget so truncation is forced.
+    monkeypatch.setattr("src.agent.settings.token_budget_per_call", 50)
+
+    base = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "user"},
+    ]
+    exchanges = [
+        _ToolExchange(
+            assistant_message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": f"call_{i}", "type": "function",
+                                "function": {"name": "web_search", "arguments": "{}"}}],
+            },
+            tool_messages=[{
+                "role": "tool", "tool_call_id": f"call_{i}",
+                "name": "web_search", "content": "x" * 80,
+            }],
+        )
+        for i in range(4)
+    ]
+
+    out = _build_context_window(base, exchanges, scratch_lines=["old activity"])
+
+    # Walk the result: every 'tool' message must be preceded by an assistant
+    # message whose tool_calls include the matching tool_call_id.
+    for i, m in enumerate(out):
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id")
+            # Find the most recent assistant with tool_calls before i.
+            paired = False
+            for j in range(i - 1, -1, -1):
+                prev = out[j]
+                if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                    ids = {tc["id"] for tc in prev["tool_calls"]}
+                    if tcid in ids:
+                        paired = True
+                    break
+            assert paired, f"orphan tool message at index {i}: {tcid}"
+
+
+def test_build_context_window_drops_scratchpad_first(monkeypatch):
+    """When over budget, the scratchpad (no tool pairing) should be dropped
+    before any verbatim exchange."""
+    from src.agent import _ToolExchange, _build_context_window
+
+    monkeypatch.setattr("src.agent.settings.token_budget_per_call", 60)
+    base = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "user"},
+    ]
+    exchanges = [
+        _ToolExchange(
+            assistant_message={
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "web_search", "arguments": "{}"}}],
+            },
+            tool_messages=[{
+                "role": "tool", "tool_call_id": "call_1",
+                "name": "web_search", "content": "x" * 50,
+            }],
+        )
+    ]
+    scratch = ["x" * 800]  # large enough that the budget is busted
+
+    out = _build_context_window(base, exchanges, scratch_lines=scratch)
+
+    # Scratchpad gone, exchange survives.
+    scratch_present = any(
+        m.get("role") == "assistant" and isinstance(m.get("content"), str)
+        and m["content"].startswith("Earlier tool activity")
+        for m in out
+    )
+    assert not scratch_present
+    assert any(m.get("role") == "tool" for m in out)
