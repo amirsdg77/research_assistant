@@ -250,7 +250,12 @@ async def _run_session_inner(
 
     # --- Phase 4: output guardrail (informational)
     summaries_only = [s for (_d, s, _u) in completed_summaries]
-    verification = await verify_report(report, summaries_only)
+    verification = await verify_report(
+        report,
+        summaries_only,
+        failed_tasks=failed_tasks,
+        session_id=session_id,
+    )
     async with session_scope() as db:
         sess = await db.get(Session, session_id)
         if sess:
@@ -751,6 +756,76 @@ def _salvage_finish_summary(calls) -> str | None:
     return None
 
 
+def _humanize_validation_error(tool_name: str, exc: ValidationError) -> str:
+    """Translate a Pydantic ValidationError into a directive for the model.
+
+    The raw `exc.errors()` is a list of dicts with internal type tags
+    (`too_short`, `string_too_long`, etc.) and `loc` tuples — usable for
+    machines but noisy for an LLM that has to reread it every iteration.
+    This helper produces one or two short imperative sentences naming the
+    field and what to do, scoped to the tools we actually expose.
+    """
+    errors = exc.errors()
+    if not errors:
+        return f"Invalid arguments for {tool_name}. Please check the schema and retry."
+
+    parts: list[str] = []
+    for err in errors:
+        field = ".".join(str(x) for x in err.get("loc", ())) or "(unknown field)"
+        etype = err.get("type", "")
+        ctx = err.get("ctx") or {}
+
+        if tool_name == "finish_task" and field == "sources" and etype == "too_short":
+            parts.append(
+                "`sources` must contain at least one URL or document reference. "
+                "Cite the sources you actually fetched or retrieved."
+            )
+        elif tool_name == "finish_task" and field == "result_summary" and etype == "too_short":
+            parts.append("`result_summary` cannot be empty.")
+        elif tool_name == "finish_task" and field == "result_summary" and etype == "string_too_long":
+            limit = ctx.get("max_length") or ctx.get("limit")
+            parts.append(
+                f"`result_summary` is too long (max {limit} chars). Tighten it."
+                if limit
+                else "`result_summary` is too long. Tighten it."
+            )
+        elif etype == "missing":
+            parts.append(f"`{field}` is required but was not provided.")
+        elif etype in ("too_short", "string_too_short"):
+            min_len = ctx.get("min_length") or ctx.get("min_items")
+            parts.append(
+                f"`{field}` is too short (min {min_len})."
+                if min_len
+                else f"`{field}` is too short."
+            )
+        elif etype in ("too_long", "string_too_long"):
+            max_len = ctx.get("max_length") or ctx.get("max_items")
+            parts.append(
+                f"`{field}` is too long (max {max_len})."
+                if max_len
+                else f"`{field}` is too long."
+            )
+        elif etype in ("greater_than", "greater_than_equal", "less_than", "less_than_equal"):
+            parts.append(f"`{field}` is out of the allowed range.")
+        elif etype.startswith("string"):
+            parts.append(f"`{field}` is not a valid string.")
+        elif etype.startswith("int") or etype.startswith("float"):
+            parts.append(f"`{field}` must be a number.")
+        else:
+            msg = err.get("msg", "invalid")
+            parts.append(f"`{field}`: {msg}.")
+
+    # Deduplicate while preserving order — the same root-cause field can
+    # appear twice under different rule types and we only want to say it once.
+    seen: set[str] = set()
+    deduped = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            deduped.append(p)
+    return " ".join(deduped)
+
+
 def _assistant_message_from_calls(calls) -> dict[str, Any]:
     """Reconstruct the OpenAI assistant message that issued these tool calls."""
     return {
@@ -810,6 +885,7 @@ async def _execute_parallel_tools(
                 "output": output,
             }
         except ValidationError as exc:
+            humanized = _humanize_validation_error(call.name, exc)
             await bus.publish(
                 AgentEvent(
                     session_id=session_id,
@@ -824,7 +900,7 @@ async def _execute_parallel_tools(
             return {
                 "tool_call_id": call.id,
                 "name": call.name,
-                "error": f"Input validation failed: {exc.errors()}",
+                "error": humanized,
             }
         except (KeyError, ToolError) as exc:
             await bus.publish(

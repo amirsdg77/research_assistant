@@ -39,7 +39,6 @@ class Settings(BaseSettings):
 
     # --- Runtime knobs ---
     log_level: str = "INFO"
-    max_tasks_per_session: int = 7
     max_tool_iterations_per_task: int = 6
     token_budget_per_call: int = 8000
     max_upload_bytes: int = 10 * 1024 * 1024
