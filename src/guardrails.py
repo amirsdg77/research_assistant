@@ -13,6 +13,7 @@ trust.
 from __future__ import annotations
 
 import re
+from uuid import UUID
 
 from src.logging_setup import Events, get_logger
 from src.models import LLMPurpose
@@ -119,12 +120,21 @@ _REPORT_VERIFICATION_FUNCTION = openai_function_from_model(
 
 
 async def verify_report(
-    report: str, source_summaries: list[str]
+    report: str,
+    source_summaries: list[str],
+    *,
+    failed_tasks: list[tuple[str, str]] | None = None,
+    session_id: UUID | None = None,
 ) -> VerificationResult:
     """Call the verifier model on a report. Always returns a result.
 
     Never raises on verifier failure: returns an empty VerificationResult
     with a note explaining the failure so the session can still complete.
+
+    failed_tasks: list of (description, reason) for tasks the agent attempted
+    but couldn't complete. Passed to the verifier so it knows the report's
+    "Tasks not completed" Limitations entries are structural acknowledgements,
+    not claims to be checked against source summaries.
     """
     if not (report or "").strip():
         result = VerificationResult(unsupported_claims=[], notes="empty report")
@@ -144,6 +154,18 @@ async def verify_report(
         else "(no source summaries provided)"
     )
 
+    failed_block = ""
+    if failed_tasks:
+        failed_lines = "\n".join(
+            f"- {desc} (reason: {reason})" for desc, reason in failed_tasks
+        )
+        failed_block = (
+            "\n\nFAILED TASKS (the report's 'Tasks not completed' Limitations "
+            "entries reference these; treat such entries as structural "
+            "acknowledgements, not claims to flag):\n"
+            f"{failed_lines}"
+        )
+
     messages = [
         {"role": "system", "content": VERIFIER_SYSTEM},
         {
@@ -153,6 +175,7 @@ async def verify_report(
                 f"{report}\n\n"
                 "SOURCE SUMMARIES:\n\n"
                 f"{sources_block}"
+                f"{failed_block}"
             ),
         },
     ]
@@ -167,6 +190,7 @@ async def verify_report(
                 "function": {"name": "report_verification"},
             },
             temperature=0.0,
+            session_id=session_id,
         )
     except Exception as exc:
         log.warning(
