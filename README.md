@@ -112,15 +112,6 @@ Two layers: automated (unit tests) and scenario-based (system tests).
 
 ---
 
-## Known limitations
-
-- **Single-worker event bus** (in-process `asyncio.Queue`). With `uvicorn --workers > 1`, SSE clients on worker A can't see events from sessions running on worker B. The bus interface is the contract; swapping in Redis pub/sub is a one-file change.
-- **Resume granularity is per-task.** A task that crashed mid-iteration restarts from iteration 0, not from the failed iteration.
-- **Verifier output is informational.** The flagged claims surface to the user but don't loop back to schedule a "patch this section" task. A natural extension.
-- **No `/cancel` endpoint.** Sessions run to completion, failure, or the per-task iteration cap.
-
----
-
 ## Environment variables
 
 `OPENAI_API_KEY`, `TAVILY_API_KEY` required. Defaults for everything else; see `.env.example`. Notable knobs: `MAX_TOOL_ITERATIONS_PER_TASK=6`, `TOKEN_BUDGET_PER_CALL=8000`, `MAX_CONCURRENT_SESSIONS=4`, `MAX_DOCS_PER_SESSION=10`, `MAX_UPLOAD_BYTES=10485760`.
